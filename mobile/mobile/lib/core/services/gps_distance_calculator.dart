@@ -118,8 +118,8 @@ class GpsDistanceCalculator {
 
     final elapsedSeconds = timestamp.difference(_lastCandidateVertexTimestamp!).inSeconds.abs();
 
-    // Stationary suppression: speed < 0.5 m/s and movement < 5m
-    final isStationary = (speedMps != null && speedMps < 0.5 && displacement < 5.0) || (displacement < 3.0);
+    // Stationary suppression: speed < 0.4 m/s and movement < 4m (suppresses stationary GPS drift)
+    final isStationary = (speedMps != null && speedMps < 0.4 && displacement < 4.0) || (displacement < 2.5);
     if (isStationary) {
       // Retain at most 1 stationary checkpoint every 120 seconds to represent dwell time without inflating storage
       if (elapsedSeconds >= 120) {
@@ -130,11 +130,11 @@ class GpsDistanceCalculator {
       return false;
     }
 
-    // Significant turn detection (direction change >= 18 degrees with some movement)
+    // Significant turn detection (direction change >= 12 degrees with some movement)
     if (_lastCandidateBearing != null && bearingDegrees != null) {
       double angleDiff = (bearingDegrees - _lastCandidateBearing!).abs() % 360.0;
       if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
-      if (angleDiff >= 18.0 && displacement >= 8.0) {
+      if (angleDiff >= 12.0 && displacement >= 4.0) {
         _lastCandidateVertexPosition = LatLng(latitude, longitude);
         _lastCandidateVertexTimestamp = timestamp;
         _lastCandidateBearing = bearingDegrees;
@@ -142,16 +142,16 @@ class GpsDistanceCalculator {
       }
     }
 
-    // Movement displacement threshold (15 meters)
-    if (displacement >= 15.0) {
+    // Movement displacement threshold (8 meters - captures multiple points along journey)
+    if (displacement >= 8.0) {
       _lastCandidateVertexPosition = LatLng(latitude, longitude);
       _lastCandidateVertexTimestamp = timestamp;
       _lastCandidateBearing = bearingDegrees;
       return true;
     }
 
-    // Time heartbeat (60 seconds while moving)
-    if (elapsedSeconds >= 60 && displacement >= 5.0) {
+    // Time heartbeat (30 seconds while moving)
+    if (elapsedSeconds >= 30 && displacement >= 4.0) {
       _lastCandidateVertexPosition = LatLng(latitude, longitude);
       _lastCandidateVertexTimestamp = timestamp;
       _lastCandidateBearing = bearingDegrees;

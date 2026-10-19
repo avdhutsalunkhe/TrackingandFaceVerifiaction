@@ -69,15 +69,15 @@ class RouteVertex {
 /// Minimizes permanent storage growth by retaining key geometry while omitting redundant linear points.
 class RouteSimplifier {
   /// Default perpendicular distance tolerance (in meters).
-  /// 6.0m provides optimal balance: eliminates jitter on straight roads while keeping curves precise.
+  /// 3.5m retains high-resolution curvature along winding roads while filtering redundant collinear points.
   final double epsilonMeters;
 
   /// Minimum angular direction change (in degrees) to force vertex retention (protects street turns).
   final double minTurnAngleDegrees;
 
   const RouteSimplifier({
-    this.epsilonMeters = 6.0,
-    this.minTurnAngleDegrees = 18.0,
+    this.epsilonMeters = 3.5,
+    this.minTurnAngleDegrees = 12.0,
   });
 
   /// Simplifies a candidate list of vertices, preserving start, end, road turns, and gaps.

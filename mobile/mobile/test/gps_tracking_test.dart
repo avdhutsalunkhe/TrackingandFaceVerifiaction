@@ -437,6 +437,102 @@ void main() {
       expect(reconstructed.first['latitude'], closeTo(18.520000, 0.0001));
       expect(reconstructed.last['longitude'], closeTo(currentLng, 0.001));
     });
+
+    test('Critical Scenario: A -> B -> C -> D -> A preserves outbound and return journey without loop collapsing', () async {
+      final db = TrackingDatabase.instance;
+      const sessionUuid = 'LOOP_JOURNEY_ABCDA';
+      final calc = GpsDistanceCalculator();
+      final startTime = DateTime.now().toUtc();
+
+      double accumulatedDistance = 0.0;
+      final List<RouteVertex> vertices = [];
+
+      // Waypoints:
+      // A: (18.5200, 73.8500)
+      // B: (18.5300, 73.8500) - ~1,110m North
+      // C: (18.5300, 73.8600) - ~1,050m East
+      // D: (18.5200, 73.8600) - ~1,110m South
+      // A: (18.5200, 73.8500) - ~1,050m West (return to origin)
+
+      final waypoints = [
+        const LatLng(18.5200, 73.8500), // A (Start)
+        const LatLng(18.5250, 73.8500),
+        const LatLng(18.5300, 73.8500), // B
+        const LatLng(18.5300, 73.8550),
+        const LatLng(18.5300, 73.8600), // C
+        const LatLng(18.5250, 73.8600),
+        const LatLng(18.5200, 73.8600), // D
+        const LatLng(18.5200, 73.8550),
+        const LatLng(18.5200, 73.8500), // A (Return to Start)
+      ];
+
+      for (int i = 0; i < waypoints.length; i++) {
+        final fixTime = startTime.add(Duration(seconds: i * 30));
+        final pt = waypoints[i];
+        final res = calc.processFix(
+          latitude: pt.latitude,
+          longitude: pt.longitude,
+          accuracyMeters: 6.0,
+          timestamp: fixTime,
+        );
+
+        if (res.isAccepted) {
+          accumulatedDistance += res.distanceAddedMeters;
+          vertices.add(RouteVertex(
+            latitude: pt.latitude,
+            longitude: pt.longitude,
+            timestamp: fixTime,
+            accuracyMeters: 6.0,
+            speedMps: 10.0,
+          ));
+        }
+      }
+
+      // 1. Total distance must reflect full perimeter (~4.3 km), NOT 0
+      expect(accumulatedDistance, greaterThan(4000.0));
+      expect(accumulatedDistance, lessThan(4600.0));
+
+      // 2. Simplification must preserve start A, corners B, C, D, and return A
+      const simplifier = RouteSimplifier(epsilonMeters: 3.5, minTurnAngleDegrees: 12.0);
+      final simplified = simplifier.simplify(vertices);
+
+      // Verify Start A and Return A are both preserved independently with distinct timestamps
+      expect(simplified.first.latitude, equals(18.5200));
+      expect(simplified.first.longitude, equals(73.8500));
+      expect(simplified.last.latitude, equals(18.5200));
+      expect(simplified.last.longitude, equals(73.8500));
+      expect(simplified.last.timestamp.isAfter(simplified.first.timestamp), isTrue);
+
+      // Verify intermediate corners B, C, D are all preserved
+      final hasB = simplified.any((v) => (v.latitude - 18.5300).abs() < 0.0001 && (v.longitude - 73.8500).abs() < 0.0001);
+      final hasC = simplified.any((v) => (v.latitude - 18.5300).abs() < 0.0001 && (v.longitude - 73.8600).abs() < 0.0001);
+      final hasD = simplified.any((v) => (v.latitude - 18.5200).abs() < 0.0001 && (v.longitude - 73.8600).abs() < 0.0001);
+      expect(hasB, isTrue, reason: 'Corner B must be preserved');
+      expect(hasC, isTrue, reason: 'Corner C must be preserved');
+      expect(hasD, isTrue, reason: 'Corner D must be preserved');
+
+      // 3. Save chunk and verify reconstructed playback preserves chronological order
+      final encodedGeom = jsonEncode(simplified.map((v) => v.toCompactList()).toList());
+      await db.insertRouteChunk({
+        'chunk_uuid': '${sessionUuid}_chk_loop',
+        'session_uuid': sessionUuid,
+        'chunk_sequence': 1,
+        'point_count': simplified.length,
+        'encoded_geometry': encodedGeom,
+        'start_time': vertices.first.timestamp.toIso8601String(),
+        'end_time': vertices.last.timestamp.toIso8601String(),
+        'distance_meters': accumulatedDistance,
+        'sync_status': 'PENDING',
+      });
+
+      final reconstructed = await db.getSessionReconstructedPoints(sessionUuid);
+      expect(reconstructed.length, equals(simplified.length));
+      expect(reconstructed.first['latitude'], equals(18.5200));
+      expect(reconstructed.last['latitude'], equals(18.5200));
+      expect(reconstructed.first['sequence_number'], equals(1));
+      expect(reconstructed.last['sequence_number'], equals(reconstructed.length));
+    });
   });
 }
+
 

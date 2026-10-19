@@ -477,8 +477,8 @@ class TrackingService with ChangeNotifier {
     final now = DateTime.now().toUtc();
     final elapsedSec = _lastChunkFlushTime != null ? now.difference(_lastChunkFlushTime!).inSeconds : 999;
 
-    // Conditions: force flush on pause/stop, buffer reaches 20 vertices, or 60s elapsed with >= 2 vertices
-    if (!force && _candidateVertices.length < 20 && !(_candidateVertices.length >= 2 && elapsedSec >= 60)) {
+    // Conditions: force flush on pause/stop, buffer reaches 15 vertices, or 30s elapsed with >= 2 vertices
+    if (!force && _candidateVertices.length < 15 && !(_candidateVertices.length >= 2 && elapsedSec >= 30)) {
       return;
     }
 
@@ -488,7 +488,7 @@ class TrackingService with ChangeNotifier {
     final verticesToProcess = List<RouteVertex>.from(_candidateVertices);
 
     // Apply Douglas-Peucker simplification with corner/turn protection
-    const simplifier = RouteSimplifier(epsilonMeters: 6.0, minTurnAngleDegrees: 18.0);
+    const simplifier = RouteSimplifier(epsilonMeters: 3.5, minTurnAngleDegrees: 12.0);
     final retainedVertices = simplifier.simplify(verticesToProcess);
 
     if (retainedVertices.isEmpty) return;
