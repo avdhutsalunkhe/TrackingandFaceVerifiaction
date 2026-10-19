@@ -6,6 +6,7 @@ import '../../core/utils/responsive_util.dart';
 import '../../core/localization/app_translations.dart';
 import '../../widgets/language_selector.dart';
 import '../../network/api_client.dart';
+import '../../core/services/device_service.dart';
 import 'change_password_screen.dart';
 import '../user/user_dashboard_screen.dart';
 import '../admin/admin_dashboard_screen.dart';
@@ -27,10 +28,12 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _isLoading = false;
   bool _obscurePassword = true;
   String? _errorMessage;
+  String? _deviceId;
 
   @override
   void initState() {
     super.initState();
+    _loadDeviceId();
     // Proactively ping candidate servers so live server is active when user attempts login
     ApiClient().failoverManager.pingAndDiscoverServer();
     if (widget.sessionExpired) {
@@ -45,6 +48,14 @@ class _LoginScreenState extends State<LoginScreen> {
       });
     }
   }
+
+  Future<void> _loadDeviceId() async {
+    try {
+      final id = await DeviceService.instance.getDeviceId();
+      if (mounted) setState(() => _deviceId = id);
+    } catch (_) {}
+  }
+
 
   @override
   void dispose() {
@@ -258,6 +269,59 @@ class _LoginScreenState extends State<LoginScreen> {
                                 )
                               : Text(AppTranslations.tr('sign_in'), style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                         ),
+
+                        // Pre-login Device ID Registration Info
+                        if (_deviceId != null) ...[
+                          SizedBox(height: isSmall ? 16 : 22),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFF8FAFC),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: const Color(0xFFE2E8F0)),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.phonelink_setup_rounded, size: 16, color: Color(0xFF64748B)),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'DEVICE ID (For Registration)',
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.bold,
+                                          color: Color(0xFF64748B),
+                                          letterSpacing: 0.5,
+                                        ),
+                                      ),
+                                      Text(
+                                        _deviceId!,
+                                        style: const TextStyle(
+                                          fontSize: 10.5,
+                                          fontFamily: 'monospace',
+                                          color: Color(0xFF1E293B),
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.copy_rounded, size: 16, color: AppColors.primary),
+                                  tooltip: 'Copy Device ID',
+                                  visualDensity: VisualDensity.compact,
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                  onPressed: () => DeviceService.instance.copyDeviceId(context),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),

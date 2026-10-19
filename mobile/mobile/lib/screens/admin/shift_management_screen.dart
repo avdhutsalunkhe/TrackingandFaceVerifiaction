@@ -162,7 +162,7 @@ class _ShiftManagementScreenState extends State<ShiftManagementScreen> {
         ],
       ),
       body: ResponsiveContainer(
-        maxWidth: 800,
+        maxWidth: context.isDesktop ? 1440 : (context.isTablet ? 960 : double.infinity),
         padding: EdgeInsets.zero,
         child: Column(
           children: [

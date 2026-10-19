@@ -118,7 +118,7 @@ class _GeofenceConfigScreenState extends State<GeofenceConfigScreen> {
       ),
       body: SafeArea(
         child: ResponsiveContainer(
-          maxWidth: 550,
+          maxWidth: context.isDesktop ? 800 : 550,
           padding: EdgeInsets.zero,
           child: SingleChildScrollView(
             padding: ResponsiveUtil.screenPadding(context),

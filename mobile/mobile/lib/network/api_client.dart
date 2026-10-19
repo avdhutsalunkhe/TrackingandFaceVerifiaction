@@ -73,7 +73,7 @@ class ApiClient {
 
     final headers = <String, String>{
       'Accept': 'application/json',
-      'X-Client-Type': 'MOBILE',
+      'X-Client-Type': kIsWeb ? 'WEB' : 'MOBILE',
     };
     if (!isMultipart) {
       headers['Content-Type'] = 'application/json';

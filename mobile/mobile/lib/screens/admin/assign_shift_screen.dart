@@ -199,7 +199,7 @@ class _AssignShiftScreenState extends State<AssignShiftScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : ResponsiveContainer(
-              maxWidth: 650,
+              maxWidth: context.isDesktop ? 1200 : (context.isTablet ? 900 : double.infinity),
               padding: EdgeInsets.zero,
               child: ListView(
                 padding: ResponsiveUtil.screenPadding(context),

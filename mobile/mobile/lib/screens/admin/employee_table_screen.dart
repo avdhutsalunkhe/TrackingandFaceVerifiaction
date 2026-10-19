@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/constants/api_constants.dart';
 import '../../core/network/api_client.dart';
@@ -25,6 +26,7 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
   List<UserModel> _filteredUsers = [];
   bool _isLoading = true;
   String? _errorMessage;
+  final Set<String> _pendingToggles = {};
 
   // Filter States
   String _roleFilter = 'ALL';
@@ -326,7 +328,7 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
             vertical: 14,
           ),
           child: ResponsiveContainer(
-            maxWidth: 1100,
+            maxWidth: context.isDesktop ? 1600 : 1100,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -725,6 +727,30 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
                           ).then((_) => _loadEmployees());
                         },
                       ),
+                      IconButton(
+                        icon: const Icon(Icons.route_rounded, size: 18, color: Color(0xFF2563EB)),
+                        tooltip: 'Employee Travel Map',
+                        onPressed: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => EmployeeTravelMapScreen(
+                                initialEmployeeId: user.id,
+                                initialEmployeeCode: user.employeeId,
+                                initialEmployeeName: user.fullName,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          user.isDeviceRegistered ? Icons.phone_android_rounded : Icons.phonelink_setup_rounded,
+                          size: 18,
+                          color: user.isDeviceRegistered ? const Color(0xFF059669) : const Color(0xFF64748B),
+                        ),
+                        tooltip: user.isDeviceRegistered ? 'Device Bound (${user.deviceId})' : 'Register Device ID',
+                        onPressed: () => _showDeviceRegistrationModal(user),
+                      ),
                     ],
                   ),
                 ),
@@ -835,14 +861,12 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
                   spacing: 6,
                   runSpacing: 6,
                   children: [
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.face_retouching_natural, size: 13),
-                      label: const Text('Face', style: TextStyle(fontSize: 11)),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        minimumSize: const Size(60, 30),
-                      ),
-                      onPressed: () {
+                    _buildFeaturePill(
+                      label: 'Face',
+                      icon: Icons.face_retouching_natural,
+                      enabled: user.faceEnabled,
+                      isLoading: _pendingToggles.contains('${user.id}_face'),
+                      onTapConfigure: () {
                         Navigator.of(context).push(
                           MaterialPageRoute(
                             builder: (_) => FaceEnrollmentScreen(
@@ -853,15 +877,14 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
                           ),
                         ).then((_) => _loadEmployees());
                       },
+                      onToggle: () => _handleFeatureToggle(user, 'face', user.faceEnabled),
                     ),
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.pin_drop_outlined, size: 13),
-                      label: const Text('Geofence', style: TextStyle(fontSize: 11)),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        minimumSize: const Size(70, 30),
-                      ),
-                      onPressed: () {
+                    _buildFeaturePill(
+                      label: 'Geofence',
+                      icon: Icons.pin_drop_outlined,
+                      enabled: user.geofenceEnabled,
+                      isLoading: _pendingToggles.contains('${user.id}_geofence'),
+                      onTapConfigure: () {
                         Navigator.of(context).push(
                           MaterialPageRoute(
                             builder: (_) => GeofenceConfigScreen(
@@ -873,32 +896,31 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
                           ),
                         ).then((_) => _loadEmployees());
                       },
+                      onToggle: () => _handleFeatureToggle(user, 'geofence', user.geofenceEnabled),
                     ),
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.schedule_rounded, size: 13),
-                      label: const Text('Shift', style: TextStyle(fontSize: 11)),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        minimumSize: const Size(60, 30),
-                      ),
-                      onPressed: () {
+                    _buildFeaturePill(
+                      label: 'Shift',
+                      icon: Icons.schedule_rounded,
+                      enabled: user.shiftEnabled,
+                      isLoading: _pendingToggles.contains('${user.id}_shift'),
+                      onTapConfigure: () {
                         Navigator.of(context).push(
                           MaterialPageRoute(
                             builder: (_) => AssignShiftScreen(preselectedUserId: user.id),
                           ),
                         ).then((_) => _loadEmployees());
                       },
+                      onToggle: () => _handleFeatureToggle(user, 'shift', user.shiftEnabled),
                     ),
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.route_rounded, size: 13, color: Color(0xFF2563EB)),
-                      label: const Text('Travel Map', style: TextStyle(fontSize: 11, color: Color(0xFF1D4ED8), fontWeight: FontWeight.bold)),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        minimumSize: const Size(86, 30),
-                        side: const BorderSide(color: Color(0xFF93C5FD)),
-                        backgroundColor: const Color(0xFFEFF6FF),
-                      ),
-                      onPressed: () {
+                    _buildFeaturePill(
+                      label: 'Travel Map',
+                      icon: Icons.route_rounded,
+                      enabled: user.travelMapEnabled,
+                      isLoading: _pendingToggles.contains('${user.id}_travel_map'),
+                      activeColor: const Color(0xFF1D4ED8),
+                      activeBgColor: const Color(0xFFEFF6FF),
+                      activeBorderColor: const Color(0xFF93C5FD),
+                      onTapConfigure: () {
                         Navigator.of(context).push(
                           MaterialPageRoute(
                             builder: (_) => EmployeeTravelMapScreen(
@@ -909,12 +931,547 @@ class _EmployeeTableScreenState extends State<EmployeeTableScreen> {
                           ),
                         );
                       },
+                      onToggle: () => _handleFeatureToggle(user, 'travel_map', user.travelMapEnabled),
                     ),
+                    _buildDeviceButton(user),
                   ],
                 ),
               ],
             ),
           ),
+        );
+      },
+    );
+  }
+
+  Widget _buildFeaturePill({
+    required String label,
+    required IconData icon,
+    required bool enabled,
+    required bool isLoading,
+    required VoidCallback onTapConfigure,
+    required VoidCallback onToggle,
+    Color activeColor = const Color(0xFF2563EB),
+    Color activeBgColor = const Color(0xFFEFF6FF),
+    Color activeBorderColor = const Color(0xFF93C5FD),
+  }) {
+    final effectiveBorderColor = enabled ? activeBorderColor : const Color(0xFFCBD5E1);
+    final effectiveBgColor = enabled ? activeBgColor : const Color(0xFFF8FAFC);
+    final effectiveTextColor = enabled ? activeColor : const Color(0xFF64748B);
+    final effectiveIconColor = enabled ? activeColor : const Color(0xFF94A3B8);
+
+    return Container(
+      height: 32,
+      decoration: BoxDecoration(
+        color: effectiveBgColor,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: effectiveBorderColor, width: 1.2),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: onTapConfigure,
+          child: Padding(
+            padding: const EdgeInsets.only(left: 8, right: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Icon(icon, size: 13, color: effectiveIconColor),
+                const SizedBox(width: 4),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: effectiveTextColor,
+                  ),
+                ),
+                const SizedBox(width: 5),
+                // Independent ON/OFF Toggle Switch
+                InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: onToggle,
+                  child: Padding(
+                    padding: const EdgeInsets.all(2.0),
+                    child: isLoading
+                        ? SizedBox(
+                            width: 26,
+                            height: 15,
+                            child: Center(
+                              child: SizedBox(
+                                width: 10,
+                                height: 10,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.5,
+                                  color: activeColor,
+                                ),
+                              ),
+                            ),
+                          )
+                        : AnimatedContainer(
+                            duration: const Duration(milliseconds: 200),
+                            width: 26,
+                            height: 15,
+                            padding: const EdgeInsets.all(1.5),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              color: enabled ? activeColor : const Color(0xFFCBD5E1),
+                            ),
+                            child: Align(
+                              alignment: enabled ? Alignment.centerRight : Alignment.centerLeft,
+                              child: Container(
+                                width: 12,
+                                height: 12,
+                                decoration: const BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceButton(UserModel user) {
+    final isRegistered = user.isDeviceRegistered;
+    return Container(
+      height: 32,
+      decoration: BoxDecoration(
+        color: isRegistered ? const Color(0xFFECFDF5) : const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: isRegistered ? const Color(0xFF6EE7B7) : const Color(0xFFCBD5E1),
+          width: 1.2,
+        ),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () => _showDeviceRegistrationModal(user),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  isRegistered ? Icons.phone_android_rounded : Icons.phonelink_setup_rounded,
+                  size: 14,
+                  color: isRegistered ? const Color(0xFF059669) : const Color(0xFF64748B),
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  'Device',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: isRegistered ? const Color(0xFF059669) : const Color(0xFF475569),
+                  ),
+                ),
+                const SizedBox(width: 5),
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isRegistered ? const Color(0xFF10B981) : const Color(0xFF94A3B8),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleFeatureToggle(UserModel user, String feature, bool currentVal) async {
+    final key = '${user.id}_$feature';
+    if (_pendingToggles.contains(key)) return;
+
+    final newVal = !currentVal;
+    setState(() {
+      _pendingToggles.add(key);
+      _updateUserFeatureLocal(user.id, feature, newVal);
+    });
+
+    try {
+      await _apiClient.post(
+        ApiConstants.adminUserFeatureToggle(user.id),
+        body: {
+          'feature': feature,
+          'enabled': newVal,
+        },
+      );
+
+      final displayName = _featureDisplayName(feature);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$displayName ${newVal ? "enabled" : "disabled"} for ${user.fullName}'),
+            backgroundColor: newVal ? const Color(0xFF10B981) : const Color(0xFF64748B),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        _updateUserFeatureLocal(user.id, feature, currentVal);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to update $feature: ${e.toString().replaceFirst("Exception: ", "")}'),
+            backgroundColor: AppColors.error,
+            duration: const Duration(seconds: 3),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _pendingToggles.remove(key);
+        });
+      }
+    }
+  }
+
+  void _updateUserFeatureLocal(int userId, String feature, bool val) {
+    setState(() {
+      _allUsers = _allUsers.map((u) {
+        if (u.id != userId) return u;
+        switch (feature) {
+          case 'face':
+            return u.copyWith(faceEnabled: val);
+          case 'geofence':
+            return u.copyWith(geofenceEnabled: val);
+          case 'shift':
+            return u.copyWith(shiftEnabled: val);
+          case 'travel_map':
+            return u.copyWith(travelMapEnabled: val);
+          default:
+            return u;
+        }
+      }).toList();
+      _applyFilters();
+    });
+  }
+
+  String _featureDisplayName(String feature) {
+    switch (feature) {
+      case 'face': return 'Face Attendance';
+      case 'geofence': return 'Geofence Verification';
+      case 'shift': return 'Shift Schedule';
+      case 'travel_map': return 'Travel Map Tracking';
+      default: return feature;
+    }
+  }
+
+  void _showDeviceRegistrationModal(UserModel user) {
+    final controller = TextEditingController(text: user.deviceId ?? '');
+    bool isSubmitting = false;
+
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogCtx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            final hasDevice = user.isDeviceRegistered && user.deviceId != null && user.deviceId!.isNotEmpty;
+
+            return Dialog(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 480),
+                padding: const EdgeInsets.all(22),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFEFF6FF),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.phonelink_lock_rounded, color: Color(0xFF2563EB), size: 22),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Device ID Registration',
+                                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                              Text(
+                                '${user.fullName} (${user.employeeId})',
+                                style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 20),
+                          onPressed: () => Navigator.pop(dialogCtx),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: hasDevice ? const Color(0xFFECFDF5) : const Color(0xFFFFFBEB),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: hasDevice ? const Color(0xFFA7F3D0) : const Color(0xFFFDE68A),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            hasDevice ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                            color: hasDevice ? const Color(0xFF059669) : const Color(0xFFD97706),
+                            size: 18,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  hasDevice ? 'Registered Device Bound' : 'No Device Registered',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                    color: hasDevice ? const Color(0xFF065F46) : const Color(0xFF92400E),
+                                  ),
+                                ),
+                                if (hasDevice) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    user.deviceId!,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontFamily: 'monospace',
+                                      color: Color(0xFF047857),
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ] else ...[
+                                  const SizedBox(height: 2),
+                                  const Text(
+                                    'This employee can currently log in from any mobile device.',
+                                    style: TextStyle(fontSize: 11, color: Color(0xFF78350F)),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                          if (hasDevice)
+                            IconButton(
+                              icon: const Icon(Icons.copy_rounded, size: 16, color: Color(0xFF059669)),
+                              tooltip: 'Copy Device ID',
+                              visualDensity: VisualDensity.compact,
+                              onPressed: () {
+                                Clipboard.setData(ClipboardData(text: user.deviceId!));
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Device ID copied to clipboard'),
+                                    duration: Duration(seconds: 2),
+                                    behavior: SnackBarBehavior.floating,
+                                  ),
+                                );
+                              },
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: controller,
+                      decoration: InputDecoration(
+                        labelText: 'Device ID (UUID)',
+                        hintText: 'e.g. 550e8400-e29b-41d4-a716-446655440000',
+                        prefixIcon: const Icon(Icons.smartphone_rounded),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.content_paste_rounded, size: 18),
+                          tooltip: 'Paste from clipboard',
+                          onPressed: () async {
+                            final data = await Clipboard.getData(Clipboard.kTextPlain);
+                            if (data?.text != null && data!.text!.isNotEmpty) {
+                              setModalState(() {
+                                controller.text = data.text!.trim();
+                              });
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    Row(
+                      children: [
+                        if (hasDevice) ...[
+                          OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppColors.error,
+                              side: const BorderSide(color: Color(0xFFFCA5A5)),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            ),
+                            icon: const Icon(Icons.phonelink_erase_rounded, size: 16),
+                            label: const Text('Remove', style: TextStyle(fontSize: 12)),
+                            onPressed: isSubmitting
+                                ? null
+                                : () async {
+                                    final confirm = await showDialog<bool>(
+                                      context: ctx,
+                                      builder: (alertCtx) => AlertDialog(
+                                        title: const Text('Remove Device Binding?'),
+                                        content: Text(
+                                          'Are you sure you want to remove device binding for ${user.fullName} (${user.employeeId})?\n\nThey will be able to log in from any device until a new device is bound.',
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () => Navigator.pop(alertCtx, false),
+                                            child: const Text('Cancel'),
+                                          ),
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+                                            onPressed: () => Navigator.pop(alertCtx, true),
+                                            child: const Text('Remove Binding'),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                    if (confirm != true) return;
+
+                                    setModalState(() => isSubmitting = true);
+                                    try {
+                                      await _apiClient.delete(ApiConstants.adminUserDevice(user.id));
+                                      if (mounted) {
+                                        setState(() {
+                                          _allUsers = _allUsers.map((u) {
+                                            if (u.id != user.id) return u;
+                                            return u.copyWith(deviceId: null, isDeviceRegistered: false);
+                                          }).toList();
+                                          _applyFilters();
+                                        });
+                                        Navigator.pop(dialogCtx);
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Device registration removed for ${user.fullName}'),
+                                            backgroundColor: const Color(0xFF10B981),
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                      }
+                                    } catch (e) {
+                                      setModalState(() => isSubmitting = false);
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Error: ${e.toString().replaceFirst("Exception: ", "")}'),
+                                            backgroundColor: AppColors.error,
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  },
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.primary,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                            icon: isSubmitting
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                                  )
+                                : const Icon(Icons.save_rounded, size: 16),
+                            label: Text(
+                              isSubmitting
+                                  ? 'Saving...'
+                                  : (hasDevice ? 'Update Device' : 'Register Device'),
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                            onPressed: isSubmitting
+                                ? null
+                                : () async {
+                                    final devId = controller.text.trim();
+                                    if (devId.isEmpty) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(
+                                          content: Text('Please enter or paste a valid Device ID'),
+                                          backgroundColor: AppColors.warning,
+                                          behavior: SnackBarBehavior.floating,
+                                        ),
+                                      );
+                                      return;
+                                    }
+
+                                    setModalState(() => isSubmitting = true);
+                                    try {
+                                      await _apiClient.post(
+                                        ApiConstants.adminUserDevice(user.id),
+                                        body: {'device_id': devId},
+                                      );
+                                      if (mounted) {
+                                        setState(() {
+                                          _allUsers = _allUsers.map((u) {
+                                            if (u.id != user.id) return u;
+                                            return u.copyWith(deviceId: devId, isDeviceRegistered: true);
+                                          }).toList();
+                                          _applyFilters();
+                                        });
+                                        Navigator.pop(dialogCtx);
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Device registered successfully for ${user.fullName}'),
+                                            backgroundColor: const Color(0xFF10B981),
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                      }
+                                    } catch (e) {
+                                      setModalState(() => isSubmitting = false);
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Error: ${e.toString().replaceFirst("Exception: ", "")}'),
+                                            backgroundColor: AppColors.error,
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
         );
       },
     );

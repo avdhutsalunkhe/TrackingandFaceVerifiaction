@@ -22,6 +22,9 @@ class ApiConstants {
   static String adminUserFace(int id) => '/api/admin/users/$id/face';
   static String adminUserGeofence(int id) => '/api/admin/users/$id/geofence';
   static String adminUserWindow(int id) => '/api/admin/users/$id/attendance-window';
+  static String adminUserFeatures(int id) => '/api/admin/users/$id/features';
+  static String adminUserFeatureToggle(int id) => '/api/admin/users/$id/features/toggle';
+  static String adminUserDevice(int id) => '/api/admin/users/$id/device';
   static const String adminAttendance = '/api/admin/attendance';
   
   // Shift Management endpoints

@@ -1,17 +1,21 @@
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../constants/api_constants.dart';
 import '../network/api_client.dart';
+import 'device_service.dart';
 
 class AuthService {
   final ApiClient _apiClient = ApiClient();
 
   Future<Map<String, dynamic>> login(String employeeId, String password) async {
+    final deviceId = await DeviceService.instance.getDeviceId();
     final res = await _apiClient.post(
       ApiConstants.login,
       body: {
         'employee_id': employeeId.trim(),
         'password': password.trim(),
-        'client_type': 'MOBILE',
+        'client_type': kIsWeb ? 'WEB' : 'MOBILE',
+        'device_id': deviceId,
       },
     );
 
@@ -21,6 +25,12 @@ class AuthService {
     await prefs.setString('employee_id', res['employee_id']);
     await prefs.setString('full_name', res['full_name']);
     await prefs.setBool('must_change_password', res['must_change_password'] ?? false);
+
+    // Save effective feature toggles
+    await prefs.setBool('face_enabled', res['face_enabled'] ?? true);
+    await prefs.setBool('geofence_enabled', res['geofence_enabled'] ?? true);
+    await prefs.setBool('shift_enabled', res['shift_enabled'] ?? true);
+    await prefs.setBool('travel_map_enabled', res['travel_map_enabled'] ?? true);
 
     return res;
   }

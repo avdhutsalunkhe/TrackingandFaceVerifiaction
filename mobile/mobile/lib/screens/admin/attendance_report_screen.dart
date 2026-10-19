@@ -54,7 +54,7 @@ class _AttendanceReportScreenState extends State<AttendanceReportScreen> {
           : RefreshIndicator(
               onRefresh: _fetchReport,
               child: ResponsiveContainer(
-                maxWidth: 750,
+                maxWidth: context.isDesktop ? 1440 : (context.isTablet ? 960 : double.infinity),
                 padding: EdgeInsets.zero,
                 child: _records.isEmpty
                     ? Center(

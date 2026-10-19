@@ -114,7 +114,7 @@ class _RegisterEmployeeScreenState extends State<RegisterEmployeeScreen> {
         child: Center(
           child: SingleChildScrollView(
             child: ResponsiveContainer(
-              maxWidth: 520,
+              maxWidth: context.isDesktop ? 700 : 520,
               padding: isSmall
                   ? const EdgeInsets.symmetric(horizontal: 16, vertical: 12)
                   : const EdgeInsets.symmetric(horizontal: 24, vertical: 20),

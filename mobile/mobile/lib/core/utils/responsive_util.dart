@@ -30,6 +30,7 @@ extension ResponsiveContext on BuildContext {
   bool get isLargeScreen => screenCategory == ScreenCategory.large;
   bool get isExtraLargeScreen => screenCategory == ScreenCategory.extraLarge;
   bool get isTablet => screenWidth >= 600;
+  bool get isDesktop => screenWidth >= 1024 || isExtraLargeScreen;
 }
 
 /// Utility for responsive dimensions, padding, font scaling, and value switching
@@ -97,8 +98,8 @@ class ResponsiveUtil {
       context,
       small: double.infinity,
       medium: double.infinity,
-      large: 640.0,
-      extraLarge: 780.0,
+      large: 960.0,
+      extraLarge: 1440.0,
     );
   }
 }

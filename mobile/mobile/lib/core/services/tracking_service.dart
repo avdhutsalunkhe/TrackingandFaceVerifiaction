@@ -118,6 +118,14 @@ class TrackingService with ChangeNotifier {
 
     _gpsError = null;
 
+    // 0. Verify if Travel Map feature toggle is enabled for this user
+    final prefs = await SharedPreferences.getInstance();
+    final travelMapEnabled = prefs.getBool('travel_map_enabled') ?? true;
+    if (!travelMapEnabled) {
+      debugPrint('[TrackingService] Travel Map feature toggle is disabled. Skipping GPS tracking start.');
+      return false;
+    }
+
     // 1. Verify Location Permissions & Hardware Availability
     final hasPermission = await _verifyLocationPrerequisites();
     if (!hasPermission) {
@@ -151,7 +159,6 @@ class TrackingService with ChangeNotifier {
     }
 
     // 3. Resolve session UUID
-    final prefs = await SharedPreferences.getInstance();
     final savedUuid = prefs.getString('active_tracking_session_uuid');
     final savedDate = prefs.getString('active_tracking_date');
 
@@ -743,6 +750,17 @@ class TrackingService with ChangeNotifier {
       body: 'Travel tracking complete. Total distance: ${(totalDist / 1000).toStringAsFixed(2)} km.',
       category: 'TRACKING',
     );
+  }
+
+  /// Handles real-time feature configuration change from server.
+  /// If Travel Map tracking is revoked while a session is active, terminates tracking immediately.
+  Future<void> handleFeatureConfigurationChange({required bool travelMapEnabled}) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('travel_map_enabled', travelMapEnabled);
+    if (!travelMapEnabled && isTracking) {
+      debugPrint('[TrackingService] travel_map_enabled turned OFF while active. Forcing immediate stop.');
+      await stopTrackingForPunchOut();
+    }
   }
 
   /// Synchronizes all queued local sessions, points, and stops with exponential backoff protection

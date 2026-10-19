@@ -24,6 +24,7 @@ import '../auth/login_screen.dart';
 import 'verify_attendance_screen.dart';
 import 'send_attendance_request_screen.dart';
 import 'attendance_history_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class UserDashboardScreen extends StatefulWidget {
   const UserDashboardScreen({Key? key}) : super(key: key);
@@ -87,6 +88,17 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
         setState(() {
           _config = res;
         });
+      }
+      if (res is Map<String, dynamic>) {
+        final prefs = await SharedPreferences.getInstance();
+        if (res['face_enabled'] != null) await prefs.setBool('face_enabled', res['face_enabled']);
+        if (res['geofence_enabled'] != null) await prefs.setBool('geofence_enabled', res['geofence_enabled']);
+        if (res['shift_enabled'] != null) await prefs.setBool('shift_enabled', res['shift_enabled']);
+        if (res['travel_map_enabled'] != null) {
+          final tme = res['travel_map_enabled'] == true;
+          await prefs.setBool('travel_map_enabled', tme);
+          await TrackingService.instance.handleFeatureConfigurationChange(travelMapEnabled: tme);
+        }
       }
       // Synchronize authoritative server time
       await _serverTimeService.syncServerTime();
@@ -468,6 +480,11 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
         final isPaused = tracking.isPaused;
         final userId = _config?['user_id'] ?? 0;
         final empId = _config?['employee_id']?.toString() ?? '';
+
+        final travelMapEnabled = _config?['travel_map_enabled'] ?? true;
+        if (!travelMapEnabled) {
+          return const SizedBox.shrink();
+        }
 
         if (!isTracking) {
           final hasError = status == TrackingStatus.error;

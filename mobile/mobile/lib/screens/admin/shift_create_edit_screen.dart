@@ -248,7 +248,7 @@ class _ShiftCreateEditScreenState extends State<ShiftCreateEditScreen> {
       body: _isSaving
           ? const Center(child: CircularProgressIndicator())
           : ResponsiveContainer(
-              maxWidth: 700,
+              maxWidth: context.isDesktop ? 1200 : (context.isTablet ? 900 : double.infinity),
               padding: EdgeInsets.zero,
               child: Form(
                 key: _formKey,
