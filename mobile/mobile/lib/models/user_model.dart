@@ -13,6 +13,7 @@ class UserModel {
   final bool geofenceEnabled;
   final bool shiftEnabled;
   final bool travelMapEnabled;
+  final bool deviceBindingEnabled;
   final String? deviceId;
   final bool isDeviceRegistered;
   final String? deviceRegisteredAt;
@@ -32,6 +33,7 @@ class UserModel {
     this.geofenceEnabled = true,
     this.shiftEnabled = true,
     this.travelMapEnabled = true,
+    this.deviceBindingEnabled = true,
     this.deviceId,
     this.isDeviceRegistered = false,
     this.deviceRegisteredAt,
@@ -53,6 +55,7 @@ class UserModel {
       geofenceEnabled: json['geofence_enabled'] ?? true,
       shiftEnabled: json['shift_enabled'] ?? true,
       travelMapEnabled: json['travel_map_enabled'] ?? true,
+      deviceBindingEnabled: json['device_binding_enabled'] ?? true,
       deviceId: json['device_id'],
       isDeviceRegistered: json['is_device_registered'] ?? (json['device_id'] != null),
       deviceRegisteredAt: json['device_registered_at'],
