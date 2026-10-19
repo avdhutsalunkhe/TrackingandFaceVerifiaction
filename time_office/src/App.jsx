@@ -18,6 +18,7 @@ import MonthlyReports from './pages/MonthlyReports';
 import Settings from './pages/Settings';
 import Leaves from './pages/Leaves';
 import AuditLogs from './pages/AuditLogs';
+import LiveTrackingMap from './pages/LiveTrackingMap';
 
 import { pingBackend, BACKEND_URL, setBackendUrl, DEFAULT_BACKEND_URL, API_BASE } from './api/client';
 
@@ -254,6 +255,7 @@ function Sidebar({ backendOnline, isChecking, onRetry, onOpenConfig, onOpenPassw
 
   const navItems = [
     { to: '/', label: 'Dashboard', icon: Activity },
+    { to: '/live-tracking', label: 'Live GPS Tracking', icon: Navigation },
     { to: '/leaves', label: 'Leaves & Absences', icon: CalendarClock },
     { to: '/daily', label: 'Daily Attendance', icon: Calendar },
     { to: '/employees', label: 'Employees', icon: Users },
@@ -542,6 +544,7 @@ function MainApp() {
         <div className="flex-1">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/live-tracking" element={<LiveTrackingMap />} />
             <Route path="/leaves" element={<Leaves />} />
             <Route path="/employees" element={<Employees />} />
             <Route path="/imports" element={<Imports />} />

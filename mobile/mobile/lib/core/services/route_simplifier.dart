@@ -1,5 +1,4 @@
 import 'dart:math' as math;
-import 'package:latlong2/latlong.dart';
 import 'gps_distance_calculator.dart';
 
 /// Point representation used during route simplification and chunk encoding

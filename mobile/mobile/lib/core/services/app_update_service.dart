@@ -1,12 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
 
+import '../../config/api_config.dart';
 import '../../network/api_client.dart';
 import 'notification_service.dart';
 
@@ -56,19 +58,31 @@ class AppUpdateService {
   static final AppUpdateService instance = AppUpdateService._internal();
   AppUpdateService._internal();
 
-  /// Default configurable metadata URL fallback
-  static String updateMetadataUrl = 'https://attend.rbpssk.com/releases/latest_release.json';
+  /// Session cache for dismissed version code so the dialog does not repeatedly harass users
+  static int? _dismissedVersionCode;
 
   Future<void> checkForUpdates(BuildContext context, {bool showNoUpdateNotice = false}) async {
+    // 1. Never show APK update prompt on Web or non-Android platforms
+    if (kIsWeb || !Platform.isAndroid) {
+      if (showNoUpdateNotice && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('App is up to date.')),
+        );
+      }
+      return;
+    }
+
     try {
       final baseUrl = ApiClient().baseUrl.replaceAll(RegExp(r'/+$'), '');
-      final endpointsToTry = [
-        '$baseUrl/api/app/latest-release',
-        updateMetadataUrl,
-      ];
+      // Try active backend baseUrl first, followed by configured public/LAN backend candidates
+      final candidateUrls = {
+        if (baseUrl.isNotEmpty) '$baseUrl/api/app/latest-release',
+        for (final host in ApiConfig.effectiveCandidates)
+          '${host.replaceAll(RegExp(r'/+$'), '')}/api/app/latest-release',
+      }.toList();
 
       http.Response? response;
-      for (final url in endpointsToTry) {
+      for (final url in candidateUrls) {
         try {
           final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
           if (res.statusCode == 200) {
@@ -94,6 +108,11 @@ class AppUpdateService {
       final currentBuildNumber = int.tryParse(packageInfo.buildNumber) ?? 1;
 
       if (updateInfo.versionCode > currentBuildNumber && context.mounted) {
+        // If user already tapped "Later" for this version in the current session, don't re-prompt automatically
+        if (!updateInfo.forceUpdate && _dismissedVersionCode == updateInfo.versionCode && !showNoUpdateNotice) {
+          return;
+        }
+
         // Record notification in local notification center
         await NotificationService.instance.showNotification(
           id: 9993,
@@ -136,7 +155,10 @@ class AppUpdateService {
         actions: [
           if (!update.forceUpdate)
             TextButton(
-              onPressed: () => Navigator.pop(ctx),
+              onPressed: () {
+                _dismissedVersionCode = update.versionCode;
+                Navigator.pop(ctx);
+              },
               child: const Text('Later'),
             ),
           ElevatedButton(

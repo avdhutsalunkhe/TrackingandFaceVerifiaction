@@ -85,6 +85,14 @@ class TrackingService with ChangeNotifier {
   final StreamController<Map<String, dynamic>> _pointStreamController = StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get pointStream => _pointStreamController.stream;
 
+  DateTime? _lastLivePingTime;
+  Position? _lastLivePingPosition;
+  Map<String, dynamic>? _currentResolvedAddress;
+  Map<String, dynamic>? get currentResolvedAddress => _currentResolvedAddress;
+
+  final StreamController<Map<String, dynamic>> _addressStreamController = StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get addressStream => _addressStreamController.stream;
+
   /// Start automatic tracking right after login upon user confirmation
   Future<void> startTrackingForLogin({
     required int userId,
@@ -531,6 +539,9 @@ class TrackingService with ChangeNotifier {
     // Always emit to live map stream so user sees their immediate position
     _pointStreamController.add(vertex.toMap(sessionUuid: _activeSessionUuid!, sequenceNumber: seq));
 
+    // Send real-time live GPS ping to backend for OpenStreetMap live marker & smart reverse geocoding
+    await _maybeSendLivePing(pos);
+
     if (shouldRetain) {
       _candidateVertices.add(vertex);
       debugPrint('[GPS-PIPE][STAGE 4] Retained candidate vertex #${_candidateVertices.length} (seq=$seq, spd=${pos.speed}m/s)');
@@ -540,6 +551,61 @@ class TrackingService with ChangeNotifier {
 
   /// Flushes buffered candidate vertices into a compressed route chunk using Douglas-Peucker simplification.
   /// Minimizes permanent database records by over 95% while keeping turns and travelled path exact.
+
+  /// Sends raw GPS coordinates to /api/tracking/live-ping on interval (15s) or movement (>= 25m)
+  Future<void> _maybeSendLivePing(Position pos) async {
+    if (!isActive) return;
+
+    final now = DateTime.now().toUtc();
+    bool shouldPing = false;
+
+    if (_lastLivePingTime == null) {
+      shouldPing = true;
+    } else {
+      final elapsedSec = now.difference(_lastLivePingTime!).inSeconds;
+      if (elapsedSec >= 15) {
+        shouldPing = true;
+      } else if (_lastLivePingPosition != null) {
+        final dist = Geolocator.distanceBetween(
+          _lastLivePingPosition!.latitude,
+          _lastLivePingPosition!.longitude,
+          pos.latitude,
+          pos.longitude,
+        );
+        if (dist >= 25.0) {
+          shouldPing = true;
+        }
+      }
+    }
+
+    if (!shouldPing) return;
+
+    _lastLivePingTime = now;
+    _lastLivePingPosition = pos;
+
+    try {
+      final body = {
+        if (_activeSessionUuid != null) 'session_uuid': _activeSessionUuid,
+        'latitude': pos.latitude,
+        'longitude': pos.longitude,
+        'accuracy_meters': pos.accuracy,
+        if (pos.speed >= 0) 'speed_mps': pos.speed,
+        if (pos.heading >= 0) 'bearing_degrees': pos.heading,
+        if (pos.altitude != 0) 'altitude_meters': pos.altitude,
+        'recorded_at': pos.timestamp.toUtc().toIso8601String(),
+      };
+
+      final res = await _apiClient.post('/api/tracking/live-ping', body: body);
+      if (res is Map && res['address'] != null) {
+        _currentResolvedAddress = Map<String, dynamic>.from(res['address']);
+        _addressStreamController.add(_currentResolvedAddress!);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Live ping deferred (offline): $e');
+    }
+  }
+
   Future<void> _flushChunkIfNeeded({bool force = false}) async {
     if (_activeSessionUuid == null) return;
     final now = DateTime.now().toUtc();
