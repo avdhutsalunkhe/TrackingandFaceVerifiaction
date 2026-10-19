@@ -57,6 +57,9 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
   // Live Stream & Route Playback
   StreamSubscription<Map<String, dynamic>>? _livePointsSub;
+  StreamSubscription<Map<String, dynamic>>? _liveAddressSub;
+  Map<String, dynamic>? _liveResolvedAddress;
+  bool _followLive = true;
   bool _isPlaying = false;
   Timer? _playbackTimer;
   int _playbackIndex = 0;
@@ -64,13 +67,16 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   @override
   void initState() {
     super.initState();
+    _liveResolvedAddress = TrackingService.instance.currentResolvedAddress;
     _initEmployeeContext();
     _subscribeToLivePoints();
+    _subscribeToLiveAddress();
   }
 
   @override
   void dispose() {
     _livePointsSub?.cancel();
+    _liveAddressSub?.cancel();
     _playbackTimer?.cancel();
     _playbackTimer = null;
     super.dispose();
@@ -100,7 +106,21 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
             _sessionDetail!['point_count'] = _rawPoints.length;
           }
         });
+        if (_followLive && mounted) {
+          _mapController.move(newCoord, _mapController.camera.zoom);
+        }
       }
+    });
+  }
+
+
+  void _subscribeToLiveAddress() {
+    _liveAddressSub?.cancel();
+    _liveAddressSub = TrackingService.instance.addressStream.listen((addr) {
+      if (!mounted) return;
+      setState(() {
+        _liveResolvedAddress = addr;
+      });
     });
   }
 
@@ -1105,6 +1125,19 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
               final toolbarButtons = [
                 OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
+                    foregroundColor: _followLive ? const Color(0xFF2563EB) : const Color(0xFF334155),
+                    side: BorderSide(color: _followLive ? const Color(0xFF2563EB) : const Color(0xFFCBD5E1)),
+                    backgroundColor: _followLive ? const Color(0xFFEFF6FF) : Colors.transparent,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  ),
+                  icon: Icon(_followLive ? Icons.gps_fixed_rounded : Icons.gps_not_fixed_rounded, size: 16),
+                  label: Text(_followLive ? 'Following Live' : 'Follow Off', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                  onPressed: () => setState(() => _followLive = !_followLive),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
                     foregroundColor: const Color(0xFF334155),
                     side: const BorderSide(color: Color(0xFFCBD5E1)),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -1298,6 +1331,10 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
             ),
           ],
 
+
+          // Live OpenStreetMap Reverse-Geocoded Telemetry Card
+          _buildLiveAddressTelemetryCard(),
+          const SizedBox(height: 12),
           // Interactive Map Area
           Container(
             height: 520,
@@ -1744,4 +1781,79 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       ),
     );
   }
+
+
+  Widget _buildLiveAddressTelemetryCard() {
+    final addr = _liveResolvedAddress;
+    final village = addr?['village'] ?? '—';
+    final locality = addr?['locality'] ?? '—';
+    final road = addr?['road'] ?? '—';
+    final district = addr?['district'] ?? 'Sangli / Kolhapur';
+    final state = addr?['state'] ?? 'Maharashtra';
+    final display = addr?['display_name'] ?? (TrackingService.instance.isActive ? 'Resolving live location name...' : 'Live GPS standby');
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF0FDF4),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFBBF7D0)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.location_on_rounded, size: 16, color: Color(0xFF16A34A)),
+              const SizedBox(width: 6),
+              const Text(
+                'Live Location (OpenStreetMap Reverse-Geocode)',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF166534),
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFDCFCE7),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  addr != null ? 'RESOLVED' : (TrackingService.instance.isActive ? 'RESOLVING...' : 'STANDBY'),
+                  style: const TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF15803D),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              Text('Village: $village •', style: const TextStyle(fontSize: 12, color: Color(0xFF1E293B), fontWeight: FontWeight.w600)),
+              Text('Locality: $locality •', style: const TextStyle(fontSize: 12, color: Color(0xFF1E293B), fontWeight: FontWeight.w600)),
+              Text('Road: $road •', style: const TextStyle(fontSize: 12, color: Color(0xFF1E293B), fontWeight: FontWeight.w600)),
+              Text('District: $district, $state', style: const TextStyle(fontSize: 12, color: Color(0xFF1E293B), fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            display,
+            style: const TextStyle(fontSize: 11, color: Color(0xFF475569)),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
 }

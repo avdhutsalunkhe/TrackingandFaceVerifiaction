@@ -1,0 +1,26 @@
+# Production Netlify / Static Hosting Cache & Security Rules
+
+# Never cache dynamic entrypoints to guarantee instant deploys
+/index.html
+  Cache-Control: no-cache, no-store, must-revalidate
+/flutter_bootstrap.js
+  Cache-Control: no-cache, no-store, must-revalidate
+/flutter_service_worker.js
+  Cache-Control: no-cache, no-store, must-revalidate
+/manifest.json
+  Cache-Control: no-cache, no-store, must-revalidate
+/version.json
+  Cache-Control: no-cache, no-store, must-revalidate
+
+# Long-term immutable caching for static assets & Canvaskit WASM
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+/canvaskit/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Global security headers & camera/geolocation permission delegation
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(self), geolocation=(self)

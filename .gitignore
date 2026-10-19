@@ -27,7 +27,9 @@ release_apks/
 # ==========================================
 # Flutter / Dart
 # ==========================================
-**/build/
+**/build/*
+!**/build/web/
+!**/build/web/**
 **/.dart_tool/
 **/.flutter-plugins-dependencies
 **/.pub-cache/

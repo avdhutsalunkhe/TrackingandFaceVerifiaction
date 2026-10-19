@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <base href="/">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="description" content="FieldStaff AI Biometric Attendance System - Enterprise face verification and geofence tracking.">
+
+  <!-- Permissions policy for Camera and GPS on web -->
+  <meta http-equiv="Permissions-Policy" content="camera=(self), geolocation=(self)">
+
+  <!-- Android / Chrome / General PWA -->
+  <meta name="theme-color" content="#1E3A8A">
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <!-- iOS Safari meta tags & icons -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FieldStaff AI">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>FieldStaff AI - Biometric & Geofence Attendance</title>
+  <link rel="manifest" href="manifest.json">
+
+  <style>
+    /* Instant CSS Splash Loader to eliminate blank white screen */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #1E3A8A;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #loading-container {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1E3A8A 0%, #1e40af 50%, #172554 100%);
+      color: #FFFFFF;
+      z-index: 999999;
+      transition: opacity 0.4s ease-out;
+    }
+    .logo-box {
+      width: 76px;
+      height: 76px;
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+      animation: pulse 2s infinite ease-in-out;
+    }
+    .logo-box svg {
+      width: 44px;
+      height: 44px;
+      fill: none;
+      stroke: #FFFFFF;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .app-title {
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+      color: #FFFFFF;
+    }
+    .app-subtitle {
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.75);
+      margin-bottom: 32px;
+      text-align: center;
+    }
+    .spinner-bar {
+      width: 140px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .spinner-bar::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 50%;
+      background: #FFFFFF;
+      border-radius: 4px;
+      animation: indeterminate 1.5s infinite ease-in-out;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.04); }
+    }
+    @keyframes indeterminate {
+      0% { left: -50%; width: 50%; }
+      50% { left: 25%; width: 60%; }
+      100% { left: 100%; width: 50%; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Seamless Branded Splash Screen -->
+  <div id="loading-container">
+    <div class="logo-box">
+      <!-- Fingerprint SVG Icon -->
+      <svg viewBox="0 0 24 24">
+        <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/>
+        <path d="M14 13.12c0 2.38 0 6.38-1 8.88"/>
+        <path d="M2 16h.01"/>
+        <path d="M21.8 16c.2-2 .131-5.354 0-6"/>
+        <path d="M9 6.8a6 6 0 0 1 9 5.2v2"/>
+        <path d="M5.8 9.6a9 9 0 0 1 14.8 1.4"/>
+        <path d="M3.5 13.5a12 12 0 0 1 17 0"/>
+        <path d="M5.3 17.8c.8-1.8 1.7-4.8 1.7-7.8a5 5 0 0 1 10 0c0 1.9-.3 4.2-.8 6.2"/>
+      </svg>
+    </div>
+    <div class="app-title">FieldStaff AI</div>
+    <div class="app-subtitle">Biometric & Geofence Attendance</div>
+    <div class="spinner-bar"></div>
+  </div>
+
+  <script>
+    // Fade out and remove the HTML splash screen once Flutter canvas is mounted
+    window.addEventListener('flutter-first-frame', function () {
+      var loader = document.getElementById('loading-container');
+      if (loader) {
+        loader.style.opacity = '0';
+        setTimeout(function() {
+          if (loader.parentNode) loader.parentNode.removeChild(loader);
+        }, 400);
+      }
+    });
+  </script>
+
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>
