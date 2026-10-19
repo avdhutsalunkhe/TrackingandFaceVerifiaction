@@ -1,0 +1,38 @@
+name: fieldstaff_attendance
+description: "FieldStaff AI Biometric Attendance System Flutter Mobile App"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  http: ^1.2.0
+  geolocator: ^11.0.0
+  camera: ^0.10.5+9
+  shared_preferences: ^2.2.2
+  intl: ^0.19.0
+  google_fonts: ^6.1.0
+  flutter_svg: ^2.0.10+1
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  sqflite: ^2.3.3+1
+  path_provider: ^2.1.2
+  path: ^1.9.0
+  flutter_local_notifications: ^17.2.1
+  timezone: ^0.9.4
+  flutter_timezone: ^5.1.1
+  package_info_plus: ^8.0.2
+  crypto: ^3.0.3
+  open_filex: ^4.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

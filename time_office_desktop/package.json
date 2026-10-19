@@ -1,0 +1,70 @@
+{
+  "name": "time-office-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "FieldStaff AI Biometric Attendance System - Time Office Desktop Application",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "dev:web": "vite --host",
+    "dev:pc": "cross-env ELECTRON=true vite",
+    "dev:electron": "cross-env ELECTRON=true vite",
+    "build": "tsc -b && cross-env ELECTRON=true vite build && electron-builder",
+    "build:web": "tsc -b && vite build",
+    "build:pc": "tsc -b && cross-env ELECTRON=true vite build && electron-builder --win --x64",
+    "build:win": "tsc -b && cross-env ELECTRON=true vite build && electron-builder --win --x64",
+    "build:renderer": "tsc -b && vite build",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.21",
+    "axios": "^1.13.6",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.16.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.13.1",
+    "recharts": "^3.8.0",
+    "tailwind-merge": "^3.5.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "autoprefixer": "^10.4.27",
+    "cross-env": "^10.1.0",
+    "electron": "^41.0.2",
+    "electron-builder": "^26.7.0",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.7.2",
+    "vite": "^6.3.0",
+    "vite-plugin-electron": "^0.29.0",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "build": {
+    "appId": "com.fieldstaff.timeoffice",
+    "productName": "FieldStaff Time Office",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

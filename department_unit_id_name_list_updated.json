@@ -1,0 +1,177 @@
+[
+  {
+    "department_id": 100,
+    "unit_number": 101,
+    "department_name": "GENERAL"
+  },
+  {
+    "department_id": 102,
+    "unit_number": 101,
+    "department_name": "PURCHASE"
+  },
+  {
+    "department_id": 106,
+    "unit_number": 101,
+    "department_name": "VIP GUEST HOUSE"
+  },
+  {
+    "department_id": 200,
+    "unit_number": 101,
+    "department_name": "ACCOUNT"
+  },
+  {
+    "department_id": 201,
+    "unit_number": 101,
+    "department_name": "COMPUTER"
+  },
+  {
+    "department_id": 300,
+    "unit_number": 101,
+    "department_name": "TIME"
+  },
+  {
+    "department_id": 400,
+    "unit_number": 101,
+    "department_name": "STORE"
+  },
+  {
+    "department_id": 401,
+    "unit_number": 101,
+    "department_name": "PETROL PUMP"
+  },
+  {
+    "department_id": 500,
+    "unit_number": 101,
+    "department_name": "VEHICLE"
+  },
+  {
+    "department_id": 600,
+    "unit_number": 101,
+    "department_name": "WATCH & WARD"
+  },
+  {
+    "department_id": 700,
+    "unit_number": 101,
+    "department_name": "LABOUR"
+  },
+  {
+    "department_id": 701,
+    "unit_number": 101,
+    "department_name": "I.S.O."
+  },
+  {
+    "department_id": 800,
+    "unit_number": 101,
+    "department_name": "CIVIL"
+  },
+  {
+    "department_id": 900,
+    "unit_number": 101,
+    "department_name": "IRRIGATION"
+  },
+  {
+    "department_id": 1200,
+    "unit_number": 101,
+    "department_name": "AGRICULTURE OFFICE"
+  },
+  {
+    "department_id": 1206,
+    "unit_number": 101,
+    "department_name": "CANE DEVELOPMENT"
+  },
+  {
+    "department_id": 1300,
+    "unit_number": 101,
+    "department_name": "Co-Generation"
+  },
+  {
+    "department_id": 1400,
+    "unit_number": 101,
+    "department_name": "DISTILLERY"
+  },
+  {
+    "department_id": 1402,
+    "unit_number": 101,
+    "department_name": "COUNTRY LIQUOR"
+  },
+  {
+    "department_id": 1403,
+    "unit_number": 101,
+    "department_name": "FOREIGN LIQUR"
+  },
+  {
+    "department_id": 1500,
+    "unit_number": 101,
+    "department_name": "ENGINEERING"
+  },
+  {
+    "department_id": 1600,
+    "unit_number": 101,
+    "department_name": "MANUFACTURING"
+  },
+  {
+    "department_id": 1800,
+    "unit_number": 101,
+    "department_name": "ENVIRONMENTAL(ENGG.)"
+  },
+  {
+    "department_id": 2000,
+    "unit_number": 101,
+    "department_name": "INSTRUMENT CELL"
+  },
+  {
+    "department_id": 2100,
+    "unit_number": 101,
+    "department_name": "SANITATION"
+  },
+  {
+    "department_id": 4200,
+    "unit_number": 102,
+    "department_name": "ACCOUNT"
+  },
+  {
+    "department_id": 4300,
+    "unit_number": 102,
+    "department_name": "TIME"
+  },
+  {
+    "department_id": 4500,
+    "unit_number": 102,
+    "department_name": "STORE"
+  },
+  {
+    "department_id": 4700,
+    "unit_number": 102,
+    "department_name": "WATCH & WARD"
+  },
+  {
+    "department_id": 5100,
+    "unit_number": 102,
+    "department_name": "MANUFACTURING"
+  },
+  {
+    "department_id": 5200,
+    "unit_number": 102,
+    "department_name": "ENGINEERING"
+  },
+  {
+    "department_id": 5202,
+    "unit_number": 102,
+    "department_name": "INSTRRUMENT CELL"
+  },
+  {
+    "department_id": 7400,
+    "unit_number": 105,
+    "department_name": "STORE"
+  },
+  {
+    "department_id": 8203,
+    "unit_number": 105,
+    "department_name": "CANE YARD"
+  },
+  {
+    "department_id": 8600,
+    "unit_number": 105,
+    "department_name": "MANUFACTURING"
+  }
+]

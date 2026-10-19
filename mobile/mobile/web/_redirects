@@ -1,0 +1,6 @@
+# Netlify HTTPS Reverse Proxy to Backend API
+# Proxies browser HTTPS calls to backend server without Mixed Content or CORS restrictions
+/api/*   http://115.244.240.22:8084/api/:splat   200!
+
+# SPA Client-Side Routing Fallback
+/*       /index.html                             200

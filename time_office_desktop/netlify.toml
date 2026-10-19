@@ -1,0 +1,18 @@
+# Netlify configuration for FieldStaff Time Office Web Console
+# Edge Function handles /api/* with automatic failover between public IPs.
+# Primary: 182.66.233.66  |  Secondary: 115.244.240.22
+
+[build]
+  command = "npm run build:web"
+  publish = "dist"
+
+# Edge function handles all /api/* with failover logic
+[[edge_functions]]
+  path = "/api/*"
+  function = "api-proxy"
+
+# ── SPA Fallback ──────────────────────────────────────────────────────────────
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200
