@@ -58,6 +58,11 @@ class GpsDistanceCalculator {
   LatLng? _lastFixPosition;
   DateTime? _lastFixTimestamp;
 
+  // Last retained candidate vertex position & bearing for adaptive vertex filtering
+  LatLng? _lastCandidateVertexPosition;
+  DateTime? _lastCandidateVertexTimestamp;
+  double? _lastCandidateBearing;
+
   LatLng? get lastReferencePosition => _distanceReferencePosition;
   DateTime? get lastReferenceTimestamp => _lastReferenceTimestamp;
   LatLng? get lastFixPosition => _lastFixPosition;
@@ -76,6 +81,84 @@ class GpsDistanceCalculator {
     _lastReferenceTimestamp = timestamp;
     _lastFixPosition = position;
     _lastFixTimestamp = timestamp;
+    _lastCandidateVertexPosition = position;
+    _lastCandidateVertexTimestamp = timestamp;
+  }
+
+  /// Evaluates whether an accepted observation should be retained as a candidate route vertex.
+  /// Suppresses stationary jitter while preserving road turns, distance milestones, and boundaries.
+  bool shouldRetainCandidateVertex({
+    required double latitude,
+    required double longitude,
+    required DateTime timestamp,
+    double? speedMps,
+    double? bearingDegrees,
+    bool isGap = false,
+  }) {
+    if (isGap) {
+      _lastCandidateVertexPosition = LatLng(latitude, longitude);
+      _lastCandidateVertexTimestamp = timestamp;
+      _lastCandidateBearing = bearingDegrees;
+      return true;
+    }
+
+    if (_lastCandidateVertexPosition == null || _lastCandidateVertexTimestamp == null) {
+      _lastCandidateVertexPosition = LatLng(latitude, longitude);
+      _lastCandidateVertexTimestamp = timestamp;
+      _lastCandidateBearing = bearingDegrees;
+      return true;
+    }
+
+    final displacement = haversineDistanceMeters(
+      _lastCandidateVertexPosition!.latitude,
+      _lastCandidateVertexPosition!.longitude,
+      latitude,
+      longitude,
+    );
+
+    final elapsedSeconds = timestamp.difference(_lastCandidateVertexTimestamp!).inSeconds.abs();
+
+    // Stationary suppression: speed < 0.5 m/s and movement < 5m
+    final isStationary = (speedMps != null && speedMps < 0.5 && displacement < 5.0) || (displacement < 3.0);
+    if (isStationary) {
+      // Retain at most 1 stationary checkpoint every 120 seconds to represent dwell time without inflating storage
+      if (elapsedSeconds >= 120) {
+        _lastCandidateVertexPosition = LatLng(latitude, longitude);
+        _lastCandidateVertexTimestamp = timestamp;
+        return true;
+      }
+      return false;
+    }
+
+    // Significant turn detection (direction change >= 18 degrees with some movement)
+    if (_lastCandidateBearing != null && bearingDegrees != null) {
+      double angleDiff = (bearingDegrees - _lastCandidateBearing!).abs() % 360.0;
+      if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
+      if (angleDiff >= 18.0 && displacement >= 8.0) {
+        _lastCandidateVertexPosition = LatLng(latitude, longitude);
+        _lastCandidateVertexTimestamp = timestamp;
+        _lastCandidateBearing = bearingDegrees;
+        return true;
+      }
+    }
+
+    // Movement displacement threshold (15 meters)
+    if (displacement >= 15.0) {
+      _lastCandidateVertexPosition = LatLng(latitude, longitude);
+      _lastCandidateVertexTimestamp = timestamp;
+      _lastCandidateBearing = bearingDegrees;
+      return true;
+    }
+
+    // Time heartbeat (60 seconds while moving)
+    if (elapsedSeconds >= 60 && displacement >= 5.0) {
+      _lastCandidateVertexPosition = LatLng(latitude, longitude);
+      _lastCandidateVertexTimestamp = timestamp;
+      _lastCandidateBearing = bearingDegrees;
+      return true;
+    }
+
+    return false;
   }
 
   /// Calculates exact great-circle distance between two coordinates using the Haversine formula

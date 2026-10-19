@@ -212,7 +212,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
             List<Map<String, dynamic>> combinedPoints = serverPoints;
             if (sessionUuid != null) {
               try {
-                final localPoints = await TrackingDatabase.instance.getSessionPoints(sessionUuid);
+                final localPoints = await TrackingDatabase.instance.getSessionReconstructedPoints(sessionUuid);
                 if (localPoints.isNotEmpty) {
                   final serverClientIds = serverPoints.map((p) => p['client_point_id']).toSet();
                   final extraLocalPoints = localPoints.where((p) => !serverClientIds.contains(p['client_point_id'])).toList();
@@ -264,7 +264,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
         if (localSessions.isNotEmpty) {
           final session = localSessions.first;
           final sessionUuid = session['session_uuid'] as String;
-          final localPoints = await TrackingDatabase.instance.getSessionPoints(sessionUuid);
+          final localPoints = await TrackingDatabase.instance.getSessionReconstructedPoints(sessionUuid);
           final latLngs = localPoints
               .map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble()))
               .toList();

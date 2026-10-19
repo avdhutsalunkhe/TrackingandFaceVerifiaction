@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -10,13 +11,15 @@ class TrackingDatabase {
 
   Database? _db;
 
-  // In-Memory storage for Web platform
+  // In-Memory storage for Web platform & testing
   final List<Map<String, dynamic>> _webOfflineSessions = [];
   final List<Map<String, dynamic>> _webOfflinePoints = [];
+  final List<Map<String, dynamic>> _webOfflineChunks = [];
   final List<Map<String, dynamic>> _webNotifications = [];
   int _webSessionSeq = 1;
   int _webNotifSeq = 1;
   int _webPointSeq = 1;
+  int _webChunkSeq = 1;
 
   bool isTestMode = false;
   bool get _useMemoryFallback => kIsWeb || isTestMode;
@@ -34,9 +37,9 @@ class TrackingDatabase {
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onCreate: (db, version) async {
-        // Table for tracking sessions created offline
+        // Table for tracking sessions created offline (1 summary row per session)
         await db.execute("""
           CREATE TABLE offline_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +54,14 @@ class TrackingDatabase {
             start_latitude REAL,
             start_longitude REAL,
             start_accuracy REAL,
+            end_latitude REAL,
+            end_longitude REAL,
             total_distance_meters REAL NOT NULL DEFAULT 0.0,
             total_duration_seconds INTEGER NOT NULL DEFAULT 0,
+            retained_point_count INTEGER NOT NULL DEFAULT 0,
+            last_accepted_latitude REAL,
+            last_accepted_longitude REAL,
+            last_accepted_time TEXT,
             sync_status TEXT NOT NULL DEFAULT 'PENDING',
             stop_sync_status TEXT NOT NULL DEFAULT 'NONE'
           )
@@ -60,7 +69,25 @@ class TrackingDatabase {
         await db.execute('CREATE INDEX idx_offline_sessions_uuid ON offline_sessions (session_uuid)');
         await db.execute('CREATE INDEX idx_offline_sessions_date ON offline_sessions (work_date)');
 
-        // Table for storing recorded GPS points offline
+        // Production Storage-Efficient Table: stores compressed route chunks (retained vertices)
+        await db.execute("""
+          CREATE TABLE offline_route_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_uuid TEXT NOT NULL UNIQUE,
+            session_uuid TEXT NOT NULL,
+            chunk_sequence INTEGER NOT NULL,
+            point_count INTEGER NOT NULL DEFAULT 0,
+            encoded_geometry TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            distance_meters REAL NOT NULL DEFAULT 0.0,
+            sync_status TEXT NOT NULL DEFAULT 'PENDING'
+          )
+        """);
+        await db.execute('CREATE INDEX idx_offline_chunks_session ON offline_route_chunks (session_uuid, chunk_sequence)');
+        await db.execute('CREATE INDEX idx_offline_chunks_sync ON offline_route_chunks (sync_status)');
+
+        // Legacy table for backward-compatible individual route points
         await db.execute("""
           CREATE TABLE offline_route_points (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +122,6 @@ class TrackingDatabase {
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          // Add offline_sessions table if missing
           await db.execute("""
             CREATE TABLE IF NOT EXISTS offline_sessions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,12 +145,43 @@ class TrackingDatabase {
           await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_sessions_uuid ON offline_sessions (session_uuid)');
           await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_sessions_date ON offline_sessions (work_date)');
 
-          // Add is_gap to offline_route_points if missing
           try {
             await db.execute("ALTER TABLE offline_route_points ADD COLUMN is_gap INTEGER NOT NULL DEFAULT 0");
           } catch (_) {}
           try {
             await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_session_seq ON offline_route_points (session_uuid, sequence_number)');
+          } catch (_) {}
+        }
+
+        if (oldVersion < 3) {
+          // Version 3: Storage-Efficient Compressed Route Chunks Table
+          await db.execute("""
+            CREATE TABLE IF NOT EXISTS offline_route_chunks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chunk_uuid TEXT NOT NULL UNIQUE,
+              session_uuid TEXT NOT NULL,
+              chunk_sequence INTEGER NOT NULL,
+              point_count INTEGER NOT NULL DEFAULT 0,
+              encoded_geometry TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              end_time TEXT NOT NULL,
+              distance_meters REAL NOT NULL DEFAULT 0.0,
+              sync_status TEXT NOT NULL DEFAULT 'PENDING'
+            )
+          """);
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_chunks_session ON offline_route_chunks (session_uuid, chunk_sequence)');
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_chunks_sync ON offline_route_chunks (sync_status)');
+
+          // Safe column additions for session summary enhancements
+          try {
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN retained_point_count INTEGER NOT NULL DEFAULT 0");
+          } catch (_) {}
+          try {
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN end_latitude REAL");
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN end_longitude REAL");
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN last_accepted_latitude REAL");
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN last_accepted_longitude REAL");
+            await db.execute("ALTER TABLE offline_sessions ADD COLUMN last_accepted_time TEXT");
           } catch (_) {}
         }
       },
@@ -295,7 +352,177 @@ class TrackingDatabase {
     );
   }
 
-  /// Rekey session UUID across offline sessions and route points when server provides canonical UUID
+  /// In-place updates to session summary record (distance, duration, retained point count, last fix)
+  Future<void> updateSessionSummary(String sessionUuid, Map<String, dynamic> updates) async {
+    if (_useMemoryFallback) {
+      for (final s in _webOfflineSessions) {
+        if (s['session_uuid'] == sessionUuid) {
+          s.addAll(updates);
+        }
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    await db.update(
+      'offline_sessions',
+      updates,
+      where: 'session_uuid = ?',
+      whereArgs: [sessionUuid],
+    );
+  }
+
+  // --- Production Compressed Route Chunks Operations ---
+
+  /// Persists an incrementally encoded route chunk containing retained vertices
+  Future<int> insertRouteChunk(Map<String, dynamic> row) async {
+    if (_useMemoryFallback) {
+      final chunk = Map<String, dynamic>.from(row);
+      chunk['id'] = _webChunkSeq++;
+      chunk['sync_status'] = chunk['sync_status'] ?? 'PENDING';
+      final existingIdx = _webOfflineChunks.indexWhere((c) => c['chunk_uuid'] == chunk['chunk_uuid']);
+      if (existingIdx >= 0) {
+        _webOfflineChunks[existingIdx] = chunk;
+      } else {
+        _webOfflineChunks.add(chunk);
+      }
+      return chunk['id'] as int;
+    }
+    final db = await database;
+    if (db == null) return 0;
+    return await db.insert(
+      'offline_route_chunks',
+      row,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Returns highest chunk sequence for this session to prevent sequence collisions
+  Future<int> getMaxChunkSequence(String sessionUuid) async {
+    if (_useMemoryFallback) {
+      final chunks = _webOfflineChunks.where((c) => c['session_uuid'] == sessionUuid);
+      if (chunks.isEmpty) return 0;
+      return chunks.map((c) => (c['chunk_sequence'] as num).toInt()).reduce(math.max);
+    }
+    final db = await database;
+    if (db == null) return 0;
+    final res = await db.rawQuery(
+      'SELECT MAX(chunk_sequence) as max_seq FROM offline_route_chunks WHERE session_uuid = ?',
+      [sessionUuid],
+    );
+    if (res.isNotEmpty && res.first['max_seq'] != null) {
+      return (res.first['max_seq'] as num).toInt();
+    }
+    return 0;
+  }
+
+  /// Retrieves pending route chunks for cloud upload
+  Future<List<Map<String, dynamic>>> getPendingRouteChunks([String? sessionUuid]) async {
+    if (_useMemoryFallback) {
+      return _webOfflineChunks
+          .where((c) => c['sync_status'] == 'PENDING' && (sessionUuid == null || c['session_uuid'] == sessionUuid))
+          .take(20)
+          .toList();
+    }
+    final db = await database;
+    if (db == null) return [];
+    final whereClause = sessionUuid != null ? 'sync_status = ? AND session_uuid = ?' : 'sync_status = ?';
+    final whereArgs = sessionUuid != null ? ['PENDING', sessionUuid] : ['PENDING'];
+
+    return await db.query(
+      'offline_route_chunks',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'session_uuid ASC, chunk_sequence ASC',
+      limit: 20,
+    );
+  }
+
+  /// Marks a batch of chunk UUIDs as successfully synchronized
+  Future<void> markChunksSynced(List<String> chunkUuids) async {
+    if (chunkUuids.isEmpty) return;
+    if (_useMemoryFallback) {
+      for (final c in _webOfflineChunks) {
+        if (chunkUuids.contains(c['chunk_uuid'])) {
+          c['sync_status'] = 'SYNCED';
+        }
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    final placeholders = List.filled(chunkUuids.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE offline_route_chunks SET sync_status = ? WHERE chunk_uuid IN ($placeholders)',
+      ['SYNCED', ...chunkUuids],
+    );
+  }
+
+  /// Retrieves all route chunks for a session ordered chronologically
+  Future<List<Map<String, dynamic>>> getSessionRouteChunks(String sessionUuid) async {
+    if (_useMemoryFallback) {
+      return _webOfflineChunks
+          .where((c) => c['session_uuid'] == sessionUuid)
+          .toList()
+        ..sort((a, b) => (a['chunk_sequence'] as int).compareTo(b['chunk_sequence'] as int));
+    }
+    final db = await database;
+    if (db == null) return [];
+    return await db.query(
+      'offline_route_chunks',
+      where: 'session_uuid = ?',
+      whereArgs: [sessionUuid],
+      orderBy: 'chunk_sequence ASC',
+    );
+  }
+
+  /// Decodes and reconstructs chronological route vertices from compressed chunks for map rendering.
+  /// Falls back to legacy individual points if no chunks exist.
+  Future<List<Map<String, dynamic>>> getSessionReconstructedPoints(String sessionUuid) async {
+    final chunks = await getSessionRouteChunks(sessionUuid);
+    if (chunks.isNotEmpty) {
+      final List<Map<String, dynamic>> reconstructed = [];
+      int seqCounter = 1;
+
+      for (final chunk in chunks) {
+        final geomStr = chunk['encoded_geometry'] as String;
+        try {
+          final decoded = jsonDecode(geomStr) as List;
+          for (final item in decoded) {
+            final lat = (item[0] as num).toDouble();
+            final lng = (item[1] as num).toDouble();
+            final epochSec = (item[2] as num).toInt();
+            final acc = (item[3] as num).toDouble();
+            final spd = item.length > 4 && item[4] != null ? (item[4] as num).toDouble() : null;
+            final brg = item.length > 5 && item[5] != null ? (item[5] as num).toDouble() : null;
+            final isGap = item.length > 6 ? (item[6] == 1 || item[6] == true) : false;
+
+            reconstructed.add({
+              'session_uuid': sessionUuid,
+              'sequence_number': seqCounter++,
+              'latitude': lat,
+              'longitude': lng,
+              'accuracy_meters': acc,
+              'altitude_meters': 0.0,
+              'speed_mps': spd,
+              'bearing_degrees': brg,
+              'recorded_at': DateTime.fromMillisecondsSinceEpoch(epochSec * 1000, isUtc: true).toIso8601String(),
+              'is_gap': isGap ? 1 : 0,
+              'sync_status': chunk['sync_status'],
+            });
+          }
+        } catch (e) {
+          debugPrint('[TrackingDatabase] Error decoding chunk ${chunk['chunk_uuid']}: $e');
+        }
+      }
+      return reconstructed;
+    }
+
+    // Fallback to legacy individual points
+    return await getSessionPoints(sessionUuid);
+  }
+
+  /// Rekey session UUID across offline sessions, route chunks, and points when server provides canonical UUID
   Future<void> rekeySessionUuid(String oldSessionUuid, String newSessionUuid) async {
     if (oldSessionUuid == newSessionUuid) return;
 
@@ -305,10 +532,18 @@ class TrackingDatabase {
           s['session_uuid'] = newSessionUuid;
         }
       }
+      for (final c in _webOfflineChunks) {
+        if (c['session_uuid'] == oldSessionUuid) {
+          c['session_uuid'] = newSessionUuid;
+          final String chunkUuid = c['chunk_uuid'] ?? '';
+          if (chunkUuid.startsWith(oldSessionUuid)) {
+            c['chunk_uuid'] = chunkUuid.replaceFirst(oldSessionUuid, newSessionUuid);
+          }
+        }
+      }
       for (final p in _webOfflinePoints) {
         if (p['session_uuid'] == oldSessionUuid) {
           p['session_uuid'] = newSessionUuid;
-          // Also update client_point_id if it starts with the old session uuid
           final String clientPtId = p['client_point_id'] ?? '';
           if (clientPtId.startsWith(oldSessionUuid)) {
             p['client_point_id'] = clientPtId.replaceFirst(oldSessionUuid, newSessionUuid);
@@ -328,6 +563,12 @@ class TrackingDatabase {
         whereArgs: [oldSessionUuid],
       );
       await txn.update(
+        'offline_route_chunks',
+        {'session_uuid': newSessionUuid},
+        where: 'session_uuid = ?',
+        whereArgs: [oldSessionUuid],
+      );
+      await txn.update(
         'offline_route_points',
         {'session_uuid': newSessionUuid},
         where: 'session_uuid = ?',
@@ -336,13 +577,26 @@ class TrackingDatabase {
     });
   }
 
-  /// Returns total count of persisted route points for a given session
+  /// Returns total count of persisted route points/vertices for a given session
   Future<int> getPointCount(String sessionUuid) async {
     if (_useMemoryFallback) {
+      final chunkPoints = _webOfflineChunks
+          .where((c) => c['session_uuid'] == sessionUuid)
+          .fold<int>(0, (sum, c) => sum + ((c['point_count'] ?? 0) as int));
+      if (chunkPoints > 0) return chunkPoints;
       return _webOfflinePoints.where((p) => p['session_uuid'] == sessionUuid).length;
     }
     final db = await database;
     if (db == null) return 0;
+
+    final chunkRes = await db.rawQuery(
+      'SELECT SUM(point_count) as total_pts FROM offline_route_chunks WHERE session_uuid = ?',
+      [sessionUuid],
+    );
+    if (chunkRes.isNotEmpty && chunkRes.first['total_pts'] != null) {
+      return (chunkRes.first['total_pts'] as num).toInt();
+    }
+
     final res = await db.rawQuery(
       'SELECT COUNT(*) as count FROM offline_route_points WHERE session_uuid = ?',
       [sessionUuid],

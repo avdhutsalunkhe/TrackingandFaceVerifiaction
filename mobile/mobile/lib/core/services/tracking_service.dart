@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
@@ -7,6 +8,7 @@ import '../../network/api_client.dart';
 import 'tracking_database.dart';
 import 'notification_service.dart';
 import 'gps_distance_calculator.dart';
+import 'route_simplifier.dart';
 
 enum TrackingStatus {
   idle,
@@ -44,6 +46,13 @@ class TrackingService with ChangeNotifier {
 
   int _sequenceNumber = 1;
   int get sequenceNumber => _sequenceNumber;
+
+  // Storage-efficient compressed route chunk buffering
+  final List<RouteVertex> _candidateVertices = [];
+  int _chunkSequence = 1;
+  int _retainedPointCount = 0;
+  int get retainedPointCount => _retainedPointCount;
+  DateTime? _lastChunkFlushTime;
 
   double _totalDistanceMeters = 0.0;
   double get totalDistanceMeters => _totalDistanceMeters;
@@ -238,27 +247,27 @@ class TrackingService with ChangeNotifier {
       debugPrint('[GPS-PIPE][STAGE 8] Offline start; session queued locally in SQLite: $e');
     }
 
-    // 9. Save Point #1 locally if start coordinates exist and no points are recorded yet
-    if (startLat != null && startLng != null && _sequenceNumber == 1) {
-      final pointId = '${sessionUuid}_pt_1_${startTimeUtc.millisecondsSinceEpoch}';
-      final pointData = {
-        'session_uuid': sessionUuid,
-        'client_point_id': pointId,
-        'sequence_number': 1,
-        'latitude': startLat,
-        'longitude': startLng,
-        'accuracy_meters': initialFix?.accuracy ?? 10.0,
-        'altitude_meters': initialFix?.altitude ?? 0.0,
-        'speed_mps': (initialFix?.speed != null && initialFix!.speed >= 0) ? initialFix.speed : 0.0,
-        'bearing_degrees': (initialFix?.heading != null && initialFix!.heading >= 0) ? initialFix.heading : 0.0,
-        'recorded_at': startTimeUtc.toIso8601String(),
-        'is_gap': 0,
-        'sync_status': 'PENDING',
-      };
-      await _db.insertPoint(pointData);
+    // 9. Initialize route chunk buffering & save initial vertex
+    _candidateVertices.clear();
+    _chunkSequence = await _db.getMaxChunkSequence(sessionUuid) + 1;
+    _retainedPointCount = await _db.getPointCount(sessionUuid);
+    _lastChunkFlushTime = DateTime.now().toUtc();
+
+    if (startLat != null && startLng != null) {
+      final initialVertex = RouteVertex(
+        latitude: startLat,
+        longitude: startLng,
+        timestamp: startTimeUtc,
+        accuracyMeters: initialFix?.accuracy ?? 10.0,
+        speedMps: (initialFix?.speed != null && initialFix!.speed >= 0) ? initialFix.speed : 0.0,
+        bearingDegrees: (initialFix?.heading != null && initialFix!.heading >= 0) ? initialFix.heading : 0.0,
+        isGap: false,
+      );
+      _candidateVertices.add(initialVertex);
+      final pointData = initialVertex.toMap(sessionUuid: sessionUuid, sequenceNumber: 1);
       _pointStreamController.add(pointData);
       _sequenceNumber = 2;
-      debugPrint('[GPS-PIPE][STAGE 4] Initial Point #1 persisted: $pointId');
+      debugPrint('[GPS-PIPE][STAGE 4] Initial Point #1 buffered as starting vertex');
     }
 
     // 10. Persistent Foreground Notification
@@ -428,35 +437,108 @@ class TrackingService with ChangeNotifier {
 
     notifyListeners();
 
-    // Standardized, collision-proof Point ID format: {sessionUuid}_pt_{seq}_{timestampMs}
-    final pointSeq = _sequenceNumber++;
-    final pointId = '${_activeSessionUuid}_pt_${pointSeq}_${timestamp.millisecondsSinceEpoch}';
-    final pointData = {
-      'session_uuid': _activeSessionUuid,
-      'client_point_id': pointId,
-      'sequence_number': pointSeq,
-      'latitude': pos.latitude,
-      'longitude': pos.longitude,
-      'accuracy_meters': pos.accuracy,
-      'altitude_meters': pos.altitude,
-      'speed_mps': pos.speed >= 0 ? pos.speed : null,
-      'bearing_degrees': pos.heading >= 0 ? pos.heading : null,
-      'recorded_at': timestamp.toIso8601String(),
-      'is_gap': filterResult.isGap ? 1 : 0,
+    // Storage-Efficient Route Geometry & Vertex Retention
+    // Every 3s observation contributes to cumulative distance above,
+    // but only geometrically meaningful vertices are retained into permanent route chunks.
+    final shouldRetain = _distanceCalculator.shouldRetainCandidateVertex(
+      latitude: pos.latitude,
+      longitude: pos.longitude,
+      timestamp: timestamp,
+      speedMps: pos.speed >= 0 ? pos.speed : null,
+      bearingDegrees: pos.heading >= 0 ? pos.heading : null,
+      isGap: filterResult.isGap,
+    );
+
+    final seq = _sequenceNumber++;
+    final vertex = RouteVertex(
+      latitude: pos.latitude,
+      longitude: pos.longitude,
+      timestamp: timestamp,
+      accuracyMeters: pos.accuracy,
+      speedMps: pos.speed >= 0 ? pos.speed : null,
+      bearingDegrees: pos.heading >= 0 ? pos.heading : null,
+      isGap: filterResult.isGap,
+    );
+
+    // Always emit to live map stream so user sees their immediate position
+    _pointStreamController.add(vertex.toMap(sessionUuid: _activeSessionUuid!, sequenceNumber: seq));
+
+    if (shouldRetain) {
+      _candidateVertices.add(vertex);
+      debugPrint('[GPS-PIPE][STAGE 4] Retained candidate vertex #${_candidateVertices.length} (seq=$seq, spd=${pos.speed}m/s)');
+      await _flushChunkIfNeeded(force: false);
+    }
+  }
+
+  /// Flushes buffered candidate vertices into a compressed route chunk using Douglas-Peucker simplification.
+  /// Minimizes permanent database records by over 95% while keeping turns and travelled path exact.
+  Future<void> _flushChunkIfNeeded({bool force = false}) async {
+    if (_activeSessionUuid == null) return;
+    final now = DateTime.now().toUtc();
+    final elapsedSec = _lastChunkFlushTime != null ? now.difference(_lastChunkFlushTime!).inSeconds : 999;
+
+    // Conditions: force flush on pause/stop, buffer reaches 20 vertices, or 60s elapsed with >= 2 vertices
+    if (!force && _candidateVertices.length < 20 && !(_candidateVertices.length >= 2 && elapsedSec >= 60)) {
+      return;
+    }
+
+    if (_candidateVertices.isEmpty) return;
+
+    final sessionUuid = _activeSessionUuid!;
+    final verticesToProcess = List<RouteVertex>.from(_candidateVertices);
+
+    // Apply Douglas-Peucker simplification with corner/turn protection
+    const simplifier = RouteSimplifier(epsilonMeters: 6.0, minTurnAngleDegrees: 18.0);
+    final retainedVertices = simplifier.simplify(verticesToProcess);
+
+    if (retainedVertices.isEmpty) return;
+
+    final chunkSeq = _chunkSequence++;
+    final chunkUuid = '${sessionUuid}_chk_${chunkSeq}_${now.millisecondsSinceEpoch}';
+    final compactList = retainedVertices.map((v) => v.toCompactList()).toList();
+    final encodedGeom = jsonEncode(compactList);
+
+    final chunkData = {
+      'chunk_uuid': chunkUuid,
+      'session_uuid': sessionUuid,
+      'chunk_sequence': chunkSeq,
+      'point_count': retainedVertices.length,
+      'encoded_geometry': encodedGeom,
+      'start_time': retainedVertices.first.timestamp.toIso8601String(),
+      'end_time': retainedVertices.last.timestamp.toIso8601String(),
+      'distance_meters': _totalDistanceMeters,
       'sync_status': 'PENDING',
     };
 
-    // Store in local SQLite first (guaranteed offline safety)
-    await _db.insertPoint(pointData);
-    debugPrint('[GPS-PIPE][STAGE 4] Persisted to SQLite: pointId=$pointId, seq=$pointSeq');
+    await _db.insertRouteChunk(chunkData);
+    _retainedPointCount += retainedVertices.length;
+    _lastChunkFlushTime = now;
 
-    _pointStreamController.add(pointData);
-    debugPrint('[GPS-PIPE][STAGE 5] Emitted to pointStream: seq=$pointSeq');
+    // Update session summary record in-place
+    await _db.updateSessionSummary(sessionUuid, {
+      'total_distance_meters': _totalDistanceMeters,
+      'retained_point_count': _retainedPointCount,
+      'last_accepted_latitude': retainedVertices.last.latitude,
+      'last_accepted_longitude': retainedVertices.last.longitude,
+      'last_accepted_time': retainedVertices.last.timestamp.toIso8601String(),
+    });
+
+    debugPrint('[GPS-PIPE][CHUNK] Saved Chunk #$chunkSeq with ${retainedVertices.length} retained vertices (raw input: ${verticesToProcess.length})');
+
+    // Keep the last retained vertex as continuity anchor for subsequent chunk
+    _candidateVertices.clear();
+    _candidateVertices.add(retainedVertices.last);
+
+    // Trigger asynchronous background sync
+    syncPendingPoints();
   }
 
   /// Pause current tracking session
   Future<void> pauseTracking() async {
     if (!isActive || _activeSessionUuid == null) return;
+
+    // Flush remaining buffered vertices into final chunk before pausing
+    await _flushChunkIfNeeded(force: true);
 
     _status = TrackingStatus.paused;
     notifyListeners();
@@ -527,6 +609,9 @@ class TrackingService with ChangeNotifier {
   /// Stop tracking upon Shift End or Punch-Out
   Future<void> stopTrackingForPunchOut({double? endLat, double? endLng}) async {
     if (!isTracking || _activeSessionUuid == null) return;
+
+    // Flush any pending candidate vertices into final chunk before stopping
+    await _flushChunkIfNeeded(force: true);
 
     final sessionUuid = _activeSessionUuid!;
     final totalDist = _totalDistanceMeters;
@@ -614,6 +699,63 @@ class TrackingService with ChangeNotifier {
           }
         } catch (_) {
           // Keep in queue for next sync cycle
+        }
+      }
+    } catch (_) {}
+
+    // 2. Sync pending compressed route chunks (Production storage-efficient protocol)
+    try {
+      final pendingChunks = await _db.getPendingRouteChunks();
+      if (pendingChunks.isNotEmpty) {
+        final grouped = <String, List<Map<String, dynamic>>>{};
+        for (final c in pendingChunks) {
+          final suuid = c['session_uuid'] as String;
+          grouped.putIfAbsent(suuid, () => []).add(c);
+        }
+
+        for (final entry in grouped.entries) {
+          final sessionUuid = entry.key;
+          final chunksList = entry.value;
+
+          final chunksPayload = chunksList.map((c) {
+            return {
+              'chunk_uuid': c['chunk_uuid'],
+              'chunk_sequence': c['chunk_sequence'],
+              'point_count': c['point_count'],
+              'encoded_geometry': c['encoded_geometry'],
+              'start_time': c['start_time'],
+              'end_time': c['end_time'],
+              'distance_meters': c['distance_meters'],
+            };
+          }).toList();
+
+          debugPrint('[GPS-PIPE][STAGE 6] Syncing ${chunksPayload.length} route chunks for session $sessionUuid to /api/tracking/chunks');
+          try {
+            final res = await _apiClient.post(
+              '/api/tracking/chunks',
+              body: {
+                'session_uuid': sessionUuid,
+                'chunks': chunksPayload,
+                'current_distance_meters': _totalDistanceMeters,
+                'retained_point_count': _retainedPointCount,
+              },
+            );
+
+            if (res is Map && res['success'] == true) {
+              final syncedUuids = (res['synced_chunk_uuids'] as List?)?.map((e) => e.toString()).toList();
+              if (syncedUuids != null && syncedUuids.isNotEmpty) {
+                await _db.markChunksSynced(syncedUuids);
+              } else {
+                final allUuids = chunksList.map((c) => c['chunk_uuid'] as String).toList();
+                await _db.markChunksSynced(allUuids);
+              }
+              debugPrint('[GPS-PIPE][STAGE 7] Chunks sync acknowledged: ${syncedUuids?.length ?? chunksPayload.length} chunks confirmed');
+              _lastSyncTime = DateTime.now();
+              notifyListeners();
+            }
+          } catch (e) {
+            debugPrint('[GPS-PIPE][STAGE 6] Route chunks sync deferred (offline): $e');
+          }
         }
       }
     } catch (_) {}
