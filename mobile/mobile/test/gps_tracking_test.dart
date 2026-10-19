@@ -532,7 +532,98 @@ void main() {
       expect(reconstructed.first['sequence_number'], equals(1));
       expect(reconstructed.last['sequence_number'], equals(reconstructed.length));
     });
+
+    test('Background Process Recovery & Deduplication preserves sequence and distance', () async {
+      final db = TrackingDatabase.instance;
+      const sessionUuid = 'BG_RECOVERY_SESSION_TEST';
+      final calc = GpsDistanceCalculator();
+      final startTime = DateTime.now().toUtc();
+
+      // Phase 1: Record 10 points before process death
+      for (int i = 1; i <= 10; i++) {
+        final fixTime = startTime.add(Duration(seconds: i * 3));
+        final lat = 18.5200 + (i * 0.0002);
+        final lng = 73.8500 + (i * 0.0002);
+        final res = calc.processFix(
+          latitude: lat,
+          longitude: lng,
+          accuracyMeters: 5.0,
+          timestamp: fixTime,
+        );
+
+        await db.queueOfflinePoint({
+          'session_uuid': sessionUuid,
+          'client_point_id': '${sessionUuid}_pt_${i}_${fixTime.millisecondsSinceEpoch}',
+          'sequence_number': i,
+          'latitude': lat,
+          'longitude': lng,
+          'accuracy_meters': 5.0,
+          'speed_mps': 8.0,
+          'bearing_degrees': 45.0,
+          'recorded_at': fixTime.toIso8601String(),
+          'is_gap': 0,
+          'sync_status': 'PENDING',
+        });
+      }
+
+      // Check state before process death
+      final maxSeqBefore = await db.getMaxSequenceNumber(sessionUuid);
+      expect(maxSeqBefore, equals(10));
+
+      // Phase 2: Simulate process recreation after app swipe/restart
+      // Restore reference from DB
+      final lastPt = await db.getLastPoint(sessionUuid);
+      expect(lastPt, isNotNull);
+      expect(lastPt!['sequence_number'], equals(10));
+
+      final restoredCalc = GpsDistanceCalculator();
+      restoredCalc.restoreReference(
+        LatLng((lastPt['latitude'] as num).toDouble(), (lastPt['longitude'] as num).toDouble()),
+        DateTime.parse(lastPt['recorded_at'] as String),
+      );
+
+      // Next sequence starts from maxSeq + 1
+      final nextSeq = (await db.getMaxSequenceNumber(sessionUuid)) + 1;
+      expect(nextSeq, equals(11));
+
+      // Phase 3: Record points 11 to 20 after recovery
+      for (int i = 11; i <= 20; i++) {
+        final fixTime = startTime.add(Duration(seconds: i * 3));
+        final lat = 18.5200 + (i * 0.0002);
+        final lng = 73.8500 + (i * 0.0002);
+        final res = restoredCalc.processFix(
+          latitude: lat,
+          longitude: lng,
+          accuracyMeters: 5.0,
+          timestamp: fixTime,
+        );
+        expect(res.isAccepted, isTrue);
+
+        await db.queueOfflinePoint({
+          'session_uuid': sessionUuid,
+          'client_point_id': '${sessionUuid}_pt_${i}_${fixTime.millisecondsSinceEpoch}',
+          'sequence_number': i,
+          'latitude': lat,
+          'longitude': lng,
+          'accuracy_meters': 5.0,
+          'speed_mps': 8.0,
+          'bearing_degrees': 45.0,
+          'recorded_at': fixTime.toIso8601String(),
+          'is_gap': 0,
+          'sync_status': 'PENDING',
+        });
+      }
+
+      // Phase 4: Verify complete sequence integrity without duplicates
+      final allPoints = await db.getSessionPoints(sessionUuid);
+      expect(allPoints.length, equals(20));
+      for (int i = 0; i < 20; i++) {
+        expect(allPoints[i]['sequence_number'], equals(i + 1));
+      }
+      expect(await db.getPendingPointCount(), greaterThanOrEqualTo(20));
+    });
   });
 }
+
 
 

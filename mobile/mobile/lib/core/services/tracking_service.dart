@@ -9,6 +9,7 @@ import 'tracking_database.dart';
 import 'notification_service.dart';
 import 'gps_distance_calculator.dart';
 import 'route_simplifier.dart';
+import 'native_background_tracking.dart';
 
 enum TrackingStatus {
   idle,
@@ -27,6 +28,7 @@ class TrackingService with ChangeNotifier {
   final GpsDistanceCalculator _distanceCalculator = GpsDistanceCalculator();
 
   StreamSubscription<Position>? _positionSub;
+  StreamSubscription<Map<String, dynamic>>? _nativeEventSub;
   Timer? _syncTimer;
   Timer? _liveLocationTimer;
   Timer? _streamRecoveryTimer;
@@ -270,13 +272,18 @@ class TrackingService with ChangeNotifier {
       debugPrint('[GPS-PIPE][STAGE 4] Initial Point #1 buffered as starting vertex');
     }
 
-    // 10. Persistent Foreground Notification
-    await NotificationService.instance.showNotification(
-      id: 9991,
-      title: 'Journey Tracking Active',
-      body: 'Recording attendance travel route in background.',
-      category: 'TRACKING',
-    );
+    // 10. Start Dedicated Native Android Location Foreground Service
+    try {
+      await NativeBackgroundTracking.startService(
+        sessionUuid: sessionUuid,
+        userId: userId,
+        attendanceId: punchId,
+        date: todayStr,
+      );
+      _listenToNativeEvents();
+    } catch (e) {
+      debugPrint('[GPS-PIPE] Native background service start error: $e');
+    }
 
     // 11. Start GPS Stream, Live Poller, and Sync Timer
     _startLocationStream();
@@ -289,6 +296,60 @@ class TrackingService with ChangeNotifier {
     syncPendingPoints();
 
     return true;
+  }
+
+  void _listenToNativeEvents() {
+    _nativeEventSub?.cancel();
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+
+    _nativeEventSub = NativeBackgroundTracking.eventStream.listen(
+      (data) {
+        if (data.containsKey('event_type')) {
+          final eventType = data['event_type'] as String;
+          final details = data['details']?.toString();
+          debugPrint('[GPS-PIPE][NATIVE-EVENT] $eventType: $details');
+          if (eventType == 'GPS_DISABLED') {
+            _gpsError = 'Location services disabled on device.';
+            notifyListeners();
+          } else if (eventType == 'GPS_RESTORED') {
+            _gpsError = null;
+            notifyListeners();
+          }
+          if (_activeSessionUuid != null) {
+            _apiClient.post(
+              '/api/tracking/event',
+              body: {
+                'session_uuid': _activeSessionUuid,
+                'event_type': eventType,
+                'details': details,
+                'timestamp': DateTime.now().toUtc().toIso8601String(),
+              },
+            ).catchError((_) {});
+          }
+          return;
+        }
+
+        // Native GPS point captured
+        final lat = (data['latitude'] as num?)?.toDouble();
+        final lng = (data['longitude'] as num?)?.toDouble();
+        final dist = (data['total_distance_meters'] as num?)?.toDouble();
+
+        if (lat != null && lng != null) {
+          _lastRecordedPosition = LatLng(lat, lng);
+          _lastRecordedTime = DateTime.now().toUtc();
+          _currentAccuracy = (data['accuracy_meters'] as num?)?.toDouble();
+          if (dist != null && dist > _totalDistanceMeters) {
+            _totalDistanceMeters = dist;
+            _distanceStreamController.add(_totalDistanceMeters);
+          }
+          _pointStreamController.add(data);
+          notifyListeners();
+        }
+      },
+      onError: (e) {
+        debugPrint('[GPS-PIPE] Native event stream error: $e');
+      },
+    );
   }
 
   Future<bool> _verifyLocationPrerequisites() async {
@@ -552,6 +613,8 @@ class TrackingService with ChangeNotifier {
 
     final sessionUuid = _activeSessionUuid!;
 
+    await NativeBackgroundTracking.pauseService();
+
     await NotificationService.instance.showNotification(
       id: 9991,
       title: 'Journey Tracking Paused',
@@ -585,6 +648,8 @@ class TrackingService with ChangeNotifier {
     notifyListeners();
 
     final sessionUuid = _activeSessionUuid!;
+
+    await NativeBackgroundTracking.resumeService();
 
     await NotificationService.instance.showNotification(
       id: 9991,
@@ -623,12 +688,17 @@ class TrackingService with ChangeNotifier {
 
     _positionSub?.cancel();
     _positionSub = null;
+    _nativeEventSub?.cancel();
+    _nativeEventSub = null;
     _streamRecoveryTimer?.cancel();
     _streamRecoveryTimer = null;
     _liveLocationTimer?.cancel();
     _liveLocationTimer = null;
     _syncTimer?.cancel();
     _syncTimer = null;
+
+    // Stop Native Android Foreground Service
+    await NativeBackgroundTracking.stopService();
 
     // Queue session stop locally in SQLite
     await _db.queueSessionStop(
@@ -853,32 +923,47 @@ class TrackingService with ChangeNotifier {
     final sessionUuid = prefs.getString('active_tracking_session_uuid');
     final savedDate = prefs.getString('active_tracking_date');
 
-    if (sessionUuid != null && savedDate != null) {
+    // Check if native Android service is currently running in background
+    final isNativeRunning = await NativeBackgroundTracking.isServiceRunning();
+
+    if ((sessionUuid != null && savedDate != null) || isNativeRunning) {
       final todayStr = DateTime.now().toIso8601String().split('T').first;
-      if (savedDate == todayStr) {
-        debugPrint('[TrackingService] Restoring active tracking session from crash: $sessionUuid');
+      if (savedDate == todayStr || isNativeRunning) {
+        debugPrint('[TrackingService] Restoring active tracking session from background/crash: $sessionUuid (nativeRunning=$isNativeRunning)');
         _activeSessionUuid = sessionUuid;
         _activeUserId = prefs.getInt('active_tracking_user_id');
         _totalDistanceMeters = prefs.getDouble('active_tracking_distance') ?? 0.0;
 
         // Restore highest sequence number to prevent collisions
-        final maxSeq = await _db.getMaxSequenceNumber(sessionUuid);
-        _sequenceNumber = maxSeq > 0 ? maxSeq + 1 : 1;
+        if (sessionUuid != null) {
+          final maxSeq = await _db.getMaxSequenceNumber(sessionUuid);
+          _sequenceNumber = maxSeq > 0 ? maxSeq + 1 : 1;
 
-        // Restore last known coordinate
-        final lastPt = await _db.getLastPoint(sessionUuid);
-        if (lastPt != null) {
-          _lastRecordedPosition = LatLng(
-            (lastPt['latitude'] as num).toDouble(),
-            (lastPt['longitude'] as num).toDouble(),
-          );
-          _lastRecordedTime = DateTime.parse(lastPt['recorded_at'] as String);
-          _distanceCalculator.restoreReference(_lastRecordedPosition, _lastRecordedTime);
+          // Restore last known coordinate
+          final lastPt = await _db.getLastPoint(sessionUuid);
+          if (lastPt != null) {
+            _lastRecordedPosition = LatLng(
+              (lastPt['latitude'] as num).toDouble(),
+              (lastPt['longitude'] as num).toDouble(),
+            );
+            _lastRecordedTime = DateTime.parse(lastPt['recorded_at'] as String);
+            _distanceCalculator.restoreReference(_lastRecordedPosition, _lastRecordedTime);
+          }
         }
 
         _status = TrackingStatus.active;
         _isResumedAfterPause = true; // Mark resumption so distance doesn't bridge crash interval
         notifyListeners();
+
+        // Attach listener to native events and start native service if not already running
+        if (!isNativeRunning && sessionUuid != null && _activeUserId != null) {
+          await NativeBackgroundTracking.startService(
+            sessionUuid: sessionUuid,
+            userId: _activeUserId!,
+            date: todayStr,
+          );
+        }
+        _listenToNativeEvents();
 
         await NotificationService.instance.showNotification(
           id: 9991,
@@ -900,7 +985,53 @@ class TrackingService with ChangeNotifier {
         await prefs.remove('active_tracking_user_id');
         await prefs.remove('active_tracking_attendance_id');
         await prefs.remove('active_tracking_date');
+        await NativeBackgroundTracking.stopService();
       }
     }
+  }
+
+  /// Comprehensive tracking health diagnostics
+  Future<Map<String, dynamic>> getTrackingHealth() async {
+    final nativeDiag = await NativeBackgroundTracking.getDiagnostics();
+    final pendingCount = await _db.getPendingPointCount();
+    final isGpsEnabled = await Geolocator.isLocationServiceEnabled();
+    final permission = await Geolocator.checkPermission();
+    final isNativeRunning = await NativeBackgroundTracking.isServiceRunning();
+    final isBatteryIgnored = await NativeBackgroundTracking.isBatteryOptimizationIgnored();
+
+    String healthState;
+    if (_status == TrackingStatus.stopped || _status == TrackingStatus.idle) {
+      healthState = 'SESSION_COMPLETED';
+    } else if (!isGpsEnabled || permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+      healthState = 'PERMISSION_OR_GPS_DISABLED';
+    } else if (_lastRecordedTime != null && DateTime.now().toUtc().difference(_lastRecordedTime!).inSeconds < 30) {
+      healthState = 'ACTIVE_RECEIVING_FIXES';
+    } else if (_status == TrackingStatus.active) {
+      healthState = 'ACTIVE_WAITING_FIX';
+    } else if (_status == TrackingStatus.paused) {
+      healthState = 'PAUSED';
+    } else {
+      healthState = 'SERVICE_INTERRUPTED';
+    }
+
+    return {
+      'status': _status.name,
+      'health_state': healthState,
+      'is_tracking_active': isActive,
+      'is_native_service_running': isNativeRunning,
+      'is_battery_optimization_ignored': isBatteryIgnored,
+      'session_uuid': _activeSessionUuid,
+      'user_id': _activeUserId,
+      'total_distance_km': (_totalDistanceMeters / 1000.0),
+      'last_fix_time': _lastRecordedTime?.toIso8601String(),
+      'last_sync_time': _lastSyncTime?.toIso8601String(),
+      'last_position': _lastRecordedPosition != null
+          ? {'lat': _lastRecordedPosition!.latitude, 'lng': _lastRecordedPosition!.longitude}
+          : null,
+      'current_accuracy_meters': _currentAccuracy,
+      'offline_pending_points': pendingCount,
+      'gps_error': _gpsError,
+      'native_diagnostics': nativeDiag,
+    };
   }
 }

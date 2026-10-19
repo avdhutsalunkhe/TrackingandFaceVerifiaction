@@ -607,6 +607,26 @@ class TrackingDatabase {
     return 0;
   }
 
+  /// Returns total count of all pending points and chunks across all sessions waiting for upload
+  Future<int> getPendingPointCount() async {
+    if (_useMemoryFallback) {
+      return _webOfflineChunks.where((c) => c['sync_status'] == 'PENDING').length +
+             _webOfflinePoints.where((p) => p['sync_status'] == 'PENDING').length;
+    }
+    final db = await database;
+    if (db == null) return 0;
+    final chunkRes = await db.rawQuery("SELECT COUNT(*) as cnt FROM offline_route_chunks WHERE sync_status = 'PENDING'");
+    final ptRes = await db.rawQuery("SELECT COUNT(*) as cnt FROM offline_route_points WHERE sync_status = 'PENDING'");
+    int total = 0;
+    if (chunkRes.isNotEmpty && chunkRes.first['cnt'] != null) {
+      total += (chunkRes.first['cnt'] as num).toInt();
+    }
+    if (ptRes.isNotEmpty && ptRes.first['cnt'] != null) {
+      total += (ptRes.first['cnt'] as num).toInt();
+    }
+    return total;
+  }
+
   /// Returns the maximum sequence number for the given session to prevent sequence resets and ID collisions.
   Future<int> getMaxSequenceNumber(String sessionUuid) async {
     if (_useMemoryFallback) {
