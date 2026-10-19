@@ -25,6 +25,8 @@ backend/.pytest_cache/
 *.rar
 release_apks/
 *.apk
+!backend/release_apks/
+!backend/release_apks/*.apk
 *.aab
 *.exe
 *.dll

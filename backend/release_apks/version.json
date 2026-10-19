@@ -1,0 +1,11 @@
+{
+  "version": "1.0.1",
+  "versionCode": 2,
+  "forceUpdate": false,
+  "minimumSupportedVersionCode": 1,
+  "releaseNotes": [
+    "Live GPS duty journey tracking with real-time odometer",
+    "15-meter precision route tracking across all travel modes (3s interval)",
+    "Automatic background sync for attendance and route breadcrumbs"
+  ]
+}

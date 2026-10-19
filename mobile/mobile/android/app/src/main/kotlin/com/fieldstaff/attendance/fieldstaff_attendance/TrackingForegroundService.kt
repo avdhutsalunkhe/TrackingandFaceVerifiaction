@@ -136,7 +136,7 @@ class TrackingForegroundService : Service(), LocationListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "FieldStaff Travel Tracking",
+                "FieldTrack Duty Tracking",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Continuous employee journey GPS tracking"
@@ -170,26 +170,26 @@ class TrackingForegroundService : Service(), LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val contentText = when (status) {
-            "Active" -> "Schedule: $scheduleDisplay • Last GPS: $lastFixStr"
-            "Interrupted" -> detailText ?: "Location permissions or GPS unavailable"
-            "Paused" -> "Tracking paused • %.2f km".format(distKm)
-            else -> detailText ?: "Duty GPS Tracking"
+        val statusLine = when (status) {
+            "Active" -> "Field Duty Tracking Active"
+            "Interrupted" -> detailText ?: "Field Duty Tracking Interrupted"
+            "Paused" -> "Field Duty Tracking Paused"
+            else -> detailText ?: "Field Duty Tracking"
         }
 
         val accuracyStr = if (accuracyMeters != null) " (±${accuracyMeters.toInt()}m)" else ""
         val bigText = """
-            Status: $status
+            $statusLine
             Schedule: $scheduleDisplay
             Last GPS update: $lastFixStr$accuracyStr
             Total Travel: %.2f km
         """.trimIndent().format(distKm)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Field Duty Tracking")
-            .setContentText(contentText)
+            .setContentTitle("FieldTrack")
+            .setContentText("$statusLine • Schedule: $scheduleDisplay")
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setSmallIcon(R.drawable.ic_stat_fieldtrack)
             .setOngoing(status == "Active" || status == "Interrupted")
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
