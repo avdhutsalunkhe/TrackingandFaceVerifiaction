@@ -83,7 +83,11 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       final sessionUuid = pointData['session_uuid'] as String?;
       final currentUuid = _sessionDetail?['session_uuid'] ?? widget.initialSessionUuid ?? TrackingService.instance.activeSessionUuid;
 
-      if (sessionUuid == currentUuid) {
+      final isCurrentActiveRecording = TrackingService.instance.isActive &&
+          (sessionUuid == TrackingService.instance.activeSessionUuid) &&
+          (_resolvedUserId == null || _resolvedUserId == TrackingService.instance.activeUserId);
+
+      if (sessionUuid == currentUuid || isCurrentActiveRecording) {
         final lat = (pointData['latitude'] as num).toDouble();
         final lng = (pointData['longitude'] as num).toDouble();
         final newCoord = LatLng(lat, lng);
@@ -201,14 +205,33 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
           if (routeRes is Map) {
             final ptsList = (routeRes['points'] ?? routeRes['route_points'] ?? []) as List;
-            final points = ptsList.map((p) => Map<String, dynamic>.from(p)).toList();
-            final latLngs = points
+            final serverPoints = ptsList.map((p) => Map<String, dynamic>.from(p)).toList();
+
+            // Merge with any un-synced points currently stored in local SQLite cache
+            final sessionUuid = (session['session_uuid'] as String?) ?? widget.initialSessionUuid;
+            List<Map<String, dynamic>> combinedPoints = serverPoints;
+            if (sessionUuid != null) {
+              try {
+                final localPoints = await TrackingDatabase.instance.getSessionPoints(sessionUuid);
+                if (localPoints.isNotEmpty) {
+                  final serverClientIds = serverPoints.map((p) => p['client_point_id']).toSet();
+                  final extraLocalPoints = localPoints.where((p) => !serverClientIds.contains(p['client_point_id'])).toList();
+                  if (extraLocalPoints.isNotEmpty) {
+                    combinedPoints = [...serverPoints, ...extraLocalPoints];
+                    combinedPoints.sort((a, b) => ((a['sequence_number'] ?? 0) as int).compareTo((b['sequence_number'] ?? 0) as int));
+                  }
+                }
+              } catch (_) {}
+            }
+
+            final latLngs = combinedPoints
                 .map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble()))
                 .toList();
 
             setState(() {
+              _isOfflineMode = false;
               _sessionDetail = Map<String, dynamic>.from(routeRes['session'] ?? session);
-              _rawPoints = points;
+              _rawPoints = combinedPoints;
               _routePoints = latLngs;
               _isLoading = false;
             });

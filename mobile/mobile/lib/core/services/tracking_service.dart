@@ -27,6 +27,7 @@ class TrackingService with ChangeNotifier {
   StreamSubscription<Position>? _positionSub;
   Timer? _syncTimer;
   Timer? _liveLocationTimer;
+  Timer? _streamRecoveryTimer;
 
   TrackingStatus _status = TrackingStatus.idle;
   TrackingStatus get status => _status;
@@ -223,20 +224,23 @@ class TrackingService with ChangeNotifier {
       );
       if (res is Map) {
         if (res['session_uuid'] != null && res['session_uuid'] != sessionUuid) {
+          final oldUuid = sessionUuid;
           sessionUuid = res['session_uuid'] as String;
           _activeSessionUuid = sessionUuid;
           await prefs.setString('active_tracking_session_uuid', sessionUuid);
+          await _db.rekeySessionUuid(oldUuid, sessionUuid);
+          debugPrint('[GPS-PIPE][STAGE 8] Re-keyed local session from $oldUuid to canonical server UUID $sessionUuid');
         }
         await _db.markSessionSynced(sessionUuid);
         _lastSyncTime = DateTime.now();
       }
     } catch (e) {
-      debugPrint('[TrackingService] Offline start; session queued locally: $e');
+      debugPrint('[GPS-PIPE][STAGE 8] Offline start; session queued locally in SQLite: $e');
     }
 
     // 9. Save Point #1 locally if start coordinates exist and no points are recorded yet
     if (startLat != null && startLng != null && _sequenceNumber == 1) {
-      final pointId = '${sessionUuid}_pt_1';
+      final pointId = '${sessionUuid}_pt_1_${startTimeUtc.millisecondsSinceEpoch}';
       final pointData = {
         'session_uuid': sessionUuid,
         'client_point_id': pointId,
@@ -254,6 +258,7 @@ class TrackingService with ChangeNotifier {
       await _db.insertPoint(pointData);
       _pointStreamController.add(pointData);
       _sequenceNumber = 2;
+      debugPrint('[GPS-PIPE][STAGE 4] Initial Point #1 persisted: $pointId');
     }
 
     // 10. Persistent Foreground Notification
@@ -308,12 +313,13 @@ class TrackingService with ChangeNotifier {
 
   void _startLocationStream() {
     _positionSub?.cancel();
+    _streamRecoveryTimer?.cancel();
 
     LocationSettings locationSettings;
     if (defaultTargetPlatform == TargetPlatform.android) {
       locationSettings = AndroidSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
+        distanceFilter: 0, // Continuous stream: do not stall when stationary or moving slowly
         intervalDuration: const Duration(seconds: 3),
         foregroundNotificationConfig: const ForegroundNotificationConfig(
           notificationTitle: 'FieldStaff Journey Tracking Active',
@@ -325,7 +331,7 @@ class TrackingService with ChangeNotifier {
     } else {
       locationSettings = const LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
+        distanceFilter: 0,
       );
     }
 
@@ -334,25 +340,48 @@ class TrackingService with ChangeNotifier {
       onError: (err) {
         _gpsError = 'GPS stream interrupted: $err';
         notifyListeners();
-        debugPrint('[TrackingService] GPS stream error: $err');
+        debugPrint('[GPS-PIPE][STAGE 2] GPS stream error: $err; auto-reconnecting in 3s...');
+        _scheduleLocationStreamRetry();
+      },
+      onDone: () {
+        debugPrint('[GPS-PIPE][STAGE 2] GPS stream closed; reconnecting in 3s...');
+        _scheduleLocationStreamRetry();
       },
     );
   }
 
+  void _scheduleLocationStreamRetry() {
+    _streamRecoveryTimer?.cancel();
+    if (!isActive || _activeSessionUuid == null) return;
+    _streamRecoveryTimer = Timer(const Duration(seconds: 3), () {
+      if (isActive && _activeSessionUuid != null) {
+        debugPrint('[GPS-PIPE][STAGE 2] Re-establishing GPS position stream...');
+        _startLocationStream();
+      }
+    });
+  }
+
   void _startLiveLocationPolling() {
     _liveLocationTimer?.cancel();
-    _liveLocationTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
+    _liveLocationTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
       if (!isActive || _activeSessionUuid == null) return;
 
       final now = DateTime.now().toUtc();
-      if (_lastRecordedTime == null || now.difference(_lastRecordedTime!).inSeconds >= 25) {
+      if (_lastRecordedTime == null || now.difference(_lastRecordedTime!).inSeconds >= 15) {
         try {
-          final pos = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 4),
-          );
-          await _handleIncomingPosition(pos, isLivePoll: true);
-          await syncPendingPoints();
+          Position? pos;
+          try {
+            pos = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.high,
+              timeLimit: const Duration(seconds: 10),
+            );
+          } catch (e) {
+            pos = await Geolocator.getLastKnownPosition();
+          }
+          if (pos != null) {
+            await _handleIncomingPosition(pos, isLivePoll: true);
+            await syncPendingPoints();
+          }
         } catch (_) {}
       }
     });
@@ -362,11 +391,14 @@ class TrackingService with ChangeNotifier {
     if (!isActive || _activeSessionUuid == null) return;
 
     final timestamp = pos.timestamp.toUtc();
+    debugPrint('[GPS-PIPE][STAGE 1] Location produced (poll=$isLivePoll): lat=${pos.latitude}, lng=${pos.longitude}, acc=${pos.accuracy}m, spd=${pos.speed}m/s');
+
     final filterResult = _distanceCalculator.processFix(
       latitude: pos.latitude,
       longitude: pos.longitude,
       accuracyMeters: pos.accuracy,
       timestamp: timestamp,
+      speedMps: pos.speed >= 0 ? pos.speed : null,
       isResumedAfterPause: _isResumedAfterPause,
     );
 
@@ -375,9 +407,11 @@ class TrackingService with ChangeNotifier {
     }
 
     if (!filterResult.isAccepted) {
-      debugPrint('[TrackingService] Fix rejected: ${filterResult.rejectionReason}');
+      debugPrint('[GPS-PIPE][STAGE 3] Fix rejected: ${filterResult.rejectionReason}');
       return;
     }
+
+    debugPrint('[GPS-PIPE][STAGE 3] Fix accepted: +${filterResult.distanceAddedMeters.toStringAsFixed(1)}m, gap=${filterResult.isGap}');
 
     _gpsError = null;
     _currentAccuracy = pos.accuracy;
@@ -394,12 +428,13 @@ class TrackingService with ChangeNotifier {
 
     notifyListeners();
 
-    // Standardized Point ID format: {sessionUuid}_pt_{sequenceNumber}
-    final pointId = '${_activeSessionUuid}_pt_$_sequenceNumber';
+    // Standardized, collision-proof Point ID format: {sessionUuid}_pt_{seq}_{timestampMs}
+    final pointSeq = _sequenceNumber++;
+    final pointId = '${_activeSessionUuid}_pt_${pointSeq}_${timestamp.millisecondsSinceEpoch}';
     final pointData = {
       'session_uuid': _activeSessionUuid,
       'client_point_id': pointId,
-      'sequence_number': _sequenceNumber++,
+      'sequence_number': pointSeq,
       'latitude': pos.latitude,
       'longitude': pos.longitude,
       'accuracy_meters': pos.accuracy,
@@ -413,7 +448,10 @@ class TrackingService with ChangeNotifier {
 
     // Store in local SQLite first (guaranteed offline safety)
     await _db.insertPoint(pointData);
+    debugPrint('[GPS-PIPE][STAGE 4] Persisted to SQLite: pointId=$pointId, seq=$pointSeq');
+
     _pointStreamController.add(pointData);
+    debugPrint('[GPS-PIPE][STAGE 5] Emitted to pointStream: seq=$pointSeq');
   }
 
   /// Pause current tracking session
@@ -425,6 +463,8 @@ class TrackingService with ChangeNotifier {
 
     _positionSub?.cancel();
     _positionSub = null;
+    _streamRecoveryTimer?.cancel();
+    _streamRecoveryTimer = null;
     _liveLocationTimer?.cancel();
     _liveLocationTimer = null;
 
@@ -498,6 +538,8 @@ class TrackingService with ChangeNotifier {
 
     _positionSub?.cancel();
     _positionSub = null;
+    _streamRecoveryTimer?.cancel();
+    _streamRecoveryTimer = null;
     _liveLocationTimer?.cancel();
     _liveLocationTimer = null;
     _syncTimer?.cancel();
@@ -605,6 +647,7 @@ class TrackingService with ChangeNotifier {
             };
           }).toList();
 
+          debugPrint('[GPS-PIPE][STAGE 6] Syncing ${pointsPayload.length} points for session $sessionUuid to /api/tracking/points');
           final res = await _apiClient.post(
             '/api/tracking/points',
             body: {
@@ -629,13 +672,14 @@ class TrackingService with ChangeNotifier {
               await _db.markPointsRejected(rejectedIds);
             }
 
+            debugPrint('[GPS-PIPE][STAGE 7] Sync acknowledged by backend: ${syncedIds?.length ?? pointsPayload.length} points confirmed');
             _lastSyncTime = DateTime.now();
             notifyListeners();
           }
         }
       }
     } catch (e) {
-      debugPrint('[TrackingService] Sync pending points deferred (offline): $e');
+      debugPrint('[GPS-PIPE][STAGE 6] Sync pending points deferred (offline): $e');
     }
 
     // 3. Sync pending session completions

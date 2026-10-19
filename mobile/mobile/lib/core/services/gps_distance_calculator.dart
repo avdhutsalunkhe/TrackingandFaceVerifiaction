@@ -44,28 +44,38 @@ class GpsDistanceCalculator {
   // Minimum displacement required from reference position before distance is committed (meters)
   final double minMovementThresholdMeters;
 
-  // Maximum physically plausible speed between fixes before flagging jump (45 m/s ≈ 162 km/h)
+  // Maximum physically plausible speed between consecutive fixes before flagging jump (~198 km/h)
   final double maxImpliedSpeedMps;
 
   // Maximum elapsed seconds without fixes before treating subsequent fix as a discontinuous gap (15 min)
   final int gapDurationSeconds;
 
+  // Dead-reckoning reference position for accumulating distance without noise drift
   LatLng? _distanceReferencePosition;
-  DateTime? _lastAcceptedTimestamp;
+  DateTime? _lastReferenceTimestamp;
+
+  // Immediately preceding consecutive accepted GPS fix for accurate point-to-point speed calculation
+  LatLng? _lastFixPosition;
+  DateTime? _lastFixTimestamp;
+
   LatLng? get lastReferencePosition => _distanceReferencePosition;
-  DateTime? get lastAcceptedTimestamp => _lastAcceptedTimestamp;
+  DateTime? get lastReferenceTimestamp => _lastReferenceTimestamp;
+  LatLng? get lastFixPosition => _lastFixPosition;
+  DateTime? get lastAcceptedTimestamp => _lastFixTimestamp ?? _lastReferenceTimestamp;
 
   GpsDistanceCalculator({
-    this.maxAllowedAccuracyMeters = 50.0,
-    this.minMovementThresholdMeters = 15.0,
-    this.maxImpliedSpeedMps = 45.0,
+    this.maxAllowedAccuracyMeters = 65.0,
+    this.minMovementThresholdMeters = 8.0,
+    this.maxImpliedSpeedMps = 55.0, // 55 m/s ≈ 198 km/h covers Indian highways & expressways
     this.gapDurationSeconds = 900,
   });
 
   /// Reset or restore reference state upon session start or recovery
   void restoreReference(LatLng? position, DateTime? timestamp) {
     _distanceReferencePosition = position;
-    _lastAcceptedTimestamp = timestamp;
+    _lastReferenceTimestamp = timestamp;
+    _lastFixPosition = position;
+    _lastFixTimestamp = timestamp;
   }
 
   /// Calculates exact great-circle distance between two coordinates using the Haversine formula
@@ -107,34 +117,76 @@ class GpsDistanceCalculator {
   }
 
   /// Evaluates an incoming GPS fix against accuracy, drift, speed, and gap rules.
-  /// Small movements (< minMovementThresholdMeters) are retained in reference so they accumulate
-  /// toward total distance rather than being lost.
+  /// Fixes are accepted and stored as valid route observations.
+  /// Distance is accumulated cleanly without noise drift or false speed rejections.
   GpsFilterResult processFix({
     required double latitude,
     required double longitude,
     required double accuracyMeters,
     required DateTime timestamp,
+    double? speedMps,
     bool isResumedAfterPause = false,
   }) {
+    // Stage 1: Coordinate validity
     if (!isValidCoordinate(latitude, longitude)) {
       return GpsFilterResult.rejected('Invalid coordinate bounds ($latitude, $longitude)');
     }
 
+    // Stage 2: Accuracy threshold
     if (accuracyMeters > maxAllowedAccuracyMeters) {
       return GpsFilterResult.rejected(
-        'Accuracy too low ($accuracyMeters m > $maxAllowedAccuracyMeters m)',
+        'Accuracy too low (${accuracyMeters.toStringAsFixed(1)}m > ${maxAllowedAccuracyMeters.toStringAsFixed(1)}m)',
       );
     }
 
     final currentCoord = LatLng(latitude, longitude);
 
     // Initial fix for a tracking journey
-    if (_distanceReferencePosition == null) {
+    if (_lastFixPosition == null || _distanceReferencePosition == null) {
       _distanceReferencePosition = currentCoord;
-      _lastAcceptedTimestamp = timestamp;
+      _lastReferenceTimestamp = timestamp;
+      _lastFixPosition = currentCoord;
+      _lastFixTimestamp = timestamp;
       return GpsFilterResult.acceptedNoDistance;
     }
 
+    // Measure delta from immediately preceding consecutive fix
+    final stepDisplacement = haversineDistanceMeters(
+      _lastFixPosition!.latitude,
+      _lastFixPosition!.longitude,
+      currentCoord.latitude,
+      currentCoord.longitude,
+    );
+
+    final elapsedMs = timestamp.difference(_lastFixTimestamp!).inMilliseconds.abs();
+    final elapsedSeconds = elapsedMs / 1000.0;
+
+    // Stage 3: Gap detection (> 15 mins or explicit pause resumption)
+    if (isResumedAfterPause || elapsedSeconds > gapDurationSeconds) {
+      _distanceReferencePosition = currentCoord;
+      _lastReferenceTimestamp = timestamp;
+      _lastFixPosition = currentCoord;
+      _lastFixTimestamp = timestamp;
+      return GpsFilterResult.acceptedWithDistance(0.0, isGap: true);
+    }
+
+    // Stage 4: Teleportation / GPS glitch detection
+    // Note: Implied speed MUST be computed over the step from the immediately preceding fix
+    // (_lastFixPosition), NOT the cumulative displacement from the dead-reckoning reference position!
+    if (elapsedSeconds > 0.5 && stepDisplacement > 40.0) {
+      final impliedSpeed = stepDisplacement / elapsedSeconds;
+      if (impliedSpeed > maxImpliedSpeedMps) {
+        return GpsFilterResult.rejected(
+          'Implied speed excessive (${impliedSpeed.toStringAsFixed(1)} m/s > $maxImpliedSpeedMps m/s for ${stepDisplacement.toStringAsFixed(1)}m in ${elapsedSeconds.toStringAsFixed(1)}s)',
+        );
+      }
+    }
+
+    // Update consecutive fix tracker for next fix's speed check
+    _lastFixPosition = currentCoord;
+    _lastFixTimestamp = timestamp;
+
+    // Stage 5: Movement threshold check for distance dead-reckoning accumulation
     final displacementFromRef = haversineDistanceMeters(
       _distanceReferencePosition!.latitude,
       _distanceReferencePosition!.longitude,
@@ -142,40 +194,15 @@ class GpsDistanceCalculator {
       currentCoord.longitude,
     );
 
-    int elapsedSeconds = 0;
-    if (_lastAcceptedTimestamp != null) {
-      elapsedSeconds = timestamp.difference(_lastAcceptedTimestamp!).inSeconds.abs();
-    }
-
-    // Gap detection: long interruption (> 15 mins) or resumed after user pause
-    if (isResumedAfterPause || elapsedSeconds > gapDurationSeconds) {
-      _distanceReferencePosition = currentCoord;
-      _lastAcceptedTimestamp = timestamp;
-      return GpsFilterResult.acceptedWithDistance(0.0, isGap: true);
-    }
-
-    // Teleportation / GPS glitch detection
-    if (elapsedSeconds > 0 && displacementFromRef > 50.0) {
-      final impliedSpeed = displacementFromRef / elapsedSeconds;
-      if (impliedSpeed > maxImpliedSpeedMps) {
-        return GpsFilterResult.rejected(
-          'Implied speed excessive ($impliedSpeed m/s > $maxImpliedSpeedMps m/s)',
-        );
-      }
-    }
-
-    // Movement threshold check:
-    // If movement from the reference position reaches the threshold, commit distance
-    // and advance the reference position.
     if (displacementFromRef >= minMovementThresholdMeters) {
       _distanceReferencePosition = currentCoord;
-      _lastAcceptedTimestamp = timestamp;
+      _lastReferenceTimestamp = timestamp;
       return GpsFilterResult.acceptedWithDistance(displacementFromRef);
     }
 
-    // Small movement (< 15m): keep the existing reference position so subsequent
-    // steps continue accumulating towards the threshold.
-    _lastAcceptedTimestamp = timestamp;
+    // Small movement (< minMovementThresholdMeters):
+    // Accepted as a valid route point so high-fidelity trajectory is maintained,
+    // but distance accumulation waits until movement crosses the threshold to avoid stationary jitter.
     return GpsFilterResult.acceptedNoDistance;
   }
 }

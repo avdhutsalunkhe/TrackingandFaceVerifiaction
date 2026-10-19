@@ -277,7 +277,13 @@ class TrackingDatabase {
       point['id'] = _webPointSeq++;
       point['sync_status'] = point['sync_status'] ?? 'PENDING';
       point['is_gap'] = point['is_gap'] ?? 0;
-      _webOfflinePoints.add(point);
+      // If client_point_id exists, replace it to avoid duplicate memory keys
+      final existingIdx = _webOfflinePoints.indexWhere((p) => p['client_point_id'] == point['client_point_id']);
+      if (existingIdx >= 0) {
+        _webOfflinePoints[existingIdx] = point;
+      } else {
+        _webOfflinePoints.add(point);
+      }
       return point['id'] as int;
     }
     final db = await database;
@@ -285,8 +291,66 @@ class TrackingDatabase {
     return await db.insert(
       'offline_route_points',
       row,
-      conflictAlgorithm: ConflictAlgorithm.ignore,
+      conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  /// Rekey session UUID across offline sessions and route points when server provides canonical UUID
+  Future<void> rekeySessionUuid(String oldSessionUuid, String newSessionUuid) async {
+    if (oldSessionUuid == newSessionUuid) return;
+
+    if (_useMemoryFallback) {
+      for (final s in _webOfflineSessions) {
+        if (s['session_uuid'] == oldSessionUuid) {
+          s['session_uuid'] = newSessionUuid;
+        }
+      }
+      for (final p in _webOfflinePoints) {
+        if (p['session_uuid'] == oldSessionUuid) {
+          p['session_uuid'] = newSessionUuid;
+          // Also update client_point_id if it starts with the old session uuid
+          final String clientPtId = p['client_point_id'] ?? '';
+          if (clientPtId.startsWith(oldSessionUuid)) {
+            p['client_point_id'] = clientPtId.replaceFirst(oldSessionUuid, newSessionUuid);
+          }
+        }
+      }
+      return;
+    }
+
+    final db = await database;
+    if (db == null) return;
+    await db.transaction((txn) async {
+      await txn.update(
+        'offline_sessions',
+        {'session_uuid': newSessionUuid},
+        where: 'session_uuid = ?',
+        whereArgs: [oldSessionUuid],
+      );
+      await txn.update(
+        'offline_route_points',
+        {'session_uuid': newSessionUuid},
+        where: 'session_uuid = ?',
+        whereArgs: [oldSessionUuid],
+      );
+    });
+  }
+
+  /// Returns total count of persisted route points for a given session
+  Future<int> getPointCount(String sessionUuid) async {
+    if (_useMemoryFallback) {
+      return _webOfflinePoints.where((p) => p['session_uuid'] == sessionUuid).length;
+    }
+    final db = await database;
+    if (db == null) return 0;
+    final res = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM offline_route_points WHERE session_uuid = ?',
+      [sessionUuid],
+    );
+    if (res.isNotEmpty && res.first['count'] != null) {
+      return (res.first['count'] as num).toInt();
+    }
+    return 0;
   }
 
   /// Returns the maximum sequence number for the given session to prevent sequence resets and ID collisions.

@@ -145,6 +145,41 @@ void main() {
       // Distance across gap must NOT be added to continuous travel distance
       expect(resumed.distanceAddedMeters, equals(0.0));
     });
+
+    test('100 continuous GPS fixes throughout journey are ALL accepted without false speed rejections', () {
+      final startTime = DateTime.now().toUtc();
+      double totalDistance = 0.0;
+      int acceptedCount = 0;
+
+      // Simulate a 100-fix journey: moving eastward at ~15 m/s (54 km/h) with 3s intervals
+      // ~45 meters per step, 100 steps = ~4.5 km journey
+      double currentLat = 18.5200;
+      double currentLng = 73.8500;
+
+      for (int i = 0; i < 100; i++) {
+        final fixTime = startTime.add(Duration(seconds: i * 3));
+        // Move ~45 meters east (each 0.0004 deg lon at this latitude is ~42m)
+        currentLng += 0.0004;
+
+        final res = calculator.processFix(
+          latitude: currentLat,
+          longitude: currentLng,
+          accuracyMeters: 8.0 + (i % 5),
+          timestamp: fixTime,
+        );
+
+        if (res.isAccepted) {
+          acceptedCount++;
+          totalDistance += res.distanceAddedMeters;
+        }
+      }
+
+      // 100% of observations throughout the journey must be accepted
+      expect(acceptedCount, equals(100));
+      // Total accumulated distance should be between 4,000m and 4,800m
+      expect(totalDistance, greaterThan(4000.0));
+      expect(totalDistance, lessThan(4800.0));
+    });
   });
 
   group('Offline SQLite Database & Sequence Number Stability', () {
@@ -177,6 +212,45 @@ void main() {
       expect(lastPoint, isNotNull);
       expect(lastPoint!['sequence_number'], equals(1));
       expect(lastPoint['client_point_id'], equals('${sessionUuid}_pt_1'));
+    });
+
+    test('rekeySessionUuid updates session and all points from old UUID to canonical UUID', () async {
+      final db = TrackingDatabase.instance;
+      const oldUuid = 'TRACK_LOCAL_TEMP_UUID';
+      const canonicalUuid = 'TRACK_CANONICAL_SERVER_UUID';
+
+      await db.queueOfflineSession({
+        'session_uuid': oldUuid,
+        'user_id': 101,
+        'work_date': '2026-10-19',
+        'start_time': DateTime.now().toUtc().toIso8601String(),
+        'status': 'RECORDING',
+        'total_distance_meters': 0.0,
+      });
+
+      await db.insertPoint({
+        'session_uuid': oldUuid,
+        'client_point_id': '${oldUuid}_pt_1_1000',
+        'sequence_number': 1,
+        'latitude': 18.5200,
+        'longitude': 73.8500,
+        'accuracy_meters': 10.0,
+        'recorded_at': DateTime.now().toUtc().toIso8601String(),
+        'sync_status': 'PENDING',
+      });
+
+      // Rekey
+      await db.rekeySessionUuid(oldUuid, canonicalUuid);
+
+      // Verify points under canonical UUID
+      final points = await db.getSessionPoints(canonicalUuid);
+      expect(points.length, equals(1));
+      expect(points.first['session_uuid'], equals(canonicalUuid));
+      expect(points.first['client_point_id'], contains(canonicalUuid));
+
+      // Verify old UUID has 0 points
+      final oldPoints = await db.getSessionPoints(oldUuid);
+      expect(oldPoints.length, equals(0));
     });
   });
 }
