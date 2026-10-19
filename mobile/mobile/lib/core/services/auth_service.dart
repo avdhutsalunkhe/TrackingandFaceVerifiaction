@@ -11,6 +11,7 @@ class AuthService {
       body: {
         'employee_id': employeeId.trim(),
         'password': password.trim(),
+        'client_type': 'MOBILE',
       },
     );
 

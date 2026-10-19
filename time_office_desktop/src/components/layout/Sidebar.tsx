@@ -30,15 +30,32 @@ export const Sidebar: React.FC = () => {
   const { logout } = useAuth();
   const location = useLocation();
 
+  // Collapsed state for high-density PC screens
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem('time_office_sidebar_collapsed') === 'true';
+  });
+
+  const toggleCollapse = () => {
+    setIsCollapsed((prev) => {
+      const next = !prev;
+      localStorage.setItem('time_office_sidebar_collapsed', String(next));
+      return next;
+    });
+  };
+
   // Track expanded accordion sections
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
     Attendance: true,
-    Reports: true,
+    Reports: false,
     MasterData: false,
     Settings: false,
   });
 
   const toggleSection = (name: string) => {
+    if (isCollapsed) {
+      setIsCollapsed(false);
+      localStorage.setItem('time_office_sidebar_collapsed', 'false');
+    }
     setOpenSections((prev) => ({ ...prev, [name]: !prev[name] }));
   };
 
@@ -106,27 +123,34 @@ export const Sidebar: React.FC = () => {
   ];
 
   return (
-    <aside className="w-64 bg-[#111622] text-slate-300 border-r border-[#1e2638] flex flex-col justify-between shrink-0 select-none shadow-lg">
+    <aside
+      className={`${
+        isCollapsed ? 'w-20' : 'w-64'
+      } bg-[#111622] text-slate-300 border-r border-[#1e2638] flex flex-col justify-between shrink-0 select-none shadow-lg transition-all duration-300 ease-in-out z-20`}
+    >
       {/* Top Branding Section */}
       <div>
         <div className="h-16 px-4 flex items-center justify-between border-b border-[#1e2638]">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 overflow-hidden">
             {/* Orange Logo Icon */}
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-[#f95700] to-[#ea4e00] flex items-center justify-center text-white shadow-md shadow-orange-500/20">
+            <div className="w-9 h-9 shrink-0 rounded-xl bg-gradient-to-br from-[#f95700] to-[#ea4e00] flex items-center justify-center text-white shadow-md shadow-orange-500/20">
               <Building2 className="w-5 h-5 stroke-[2.5]" />
             </div>
-            <div>
-              <div className="text-sm font-bold text-white leading-tight tracking-tight">
-                FieldStaff
+            {!isCollapsed && (
+              <div className="transition-opacity duration-200">
+                <div className="text-sm font-bold text-white leading-tight tracking-tight">
+                  FieldStaff
+                </div>
+                <div className="text-[11px] text-slate-400 font-medium leading-none mt-0.5">
+                  Time Office
+                </div>
               </div>
-              <div className="text-[11px] text-slate-400 font-medium leading-none mt-0.5">
-                Time Office
-              </div>
-            </div>
+            )}
           </div>
           <button 
+            onClick={toggleCollapse}
             className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800/60 rounded-lg transition-colors"
-            title="Collapse Sidebar"
+            title={isCollapsed ? 'Expand Sidebar' : 'Collapse Sidebar'}
           >
             <Menu className="w-4 h-4" />
           </button>
@@ -158,8 +182,11 @@ export const Sidebar: React.FC = () => {
                 <NavLink
                   key={group.name}
                   to={group.path}
+                  title={isCollapsed ? group.name : undefined}
                   className={({ isActive }) =>
-                    `flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold transition-all ${
+                    `flex items-center ${
+                      isCollapsed ? 'justify-center px-2' : 'gap-3 px-3'
+                    } py-2.5 rounded-lg text-xs font-semibold transition-all ${
                       isActive
                         ? 'bg-[#f95700] text-white shadow-md shadow-orange-500/20'
                         : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
@@ -167,35 +194,40 @@ export const Sidebar: React.FC = () => {
                   }
                 >
                   <Icon className="w-4 h-4 shrink-0" />
-                  <span>{group.name}</span>
+                  {!isCollapsed && <span className="truncate">{group.name}</span>}
                 </NavLink>
               );
             }
 
             return (
-              <div key={group.name} className="space-y-1">
+              <div key={group.name} className="space-y-1 group/accordion relative">
                 {/* Accordion Parent Item */}
                 <button
                   onClick={() => toggleSection(group.name)}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs font-semibold transition-all ${
+                  title={isCollapsed ? group.name : undefined}
+                  className={`w-full flex items-center ${
+                    isCollapsed ? 'justify-center px-2' : 'justify-between px-3'
+                  } py-2.5 rounded-lg text-xs font-semibold transition-all ${
                     isGroupActive
                       ? 'bg-[#f95700] text-white shadow-md shadow-orange-500/20'
                       : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
                   }`}
                 >
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-3 overflow-hidden">
                     <Icon className="w-4 h-4 shrink-0" />
-                    <span>{group.name}</span>
+                    {!isCollapsed && <span className="truncate">{group.name}</span>}
                   </div>
-                  <ChevronDown
-                    className={`w-3.5 h-3.5 transition-transform duration-200 ${
-                      isOpen ? 'rotate-180' : ''
-                    }`}
-                  />
+                  {!isCollapsed && (
+                    <ChevronDown
+                      className={`w-3.5 h-3.5 transition-transform duration-200 shrink-0 ${
+                        isOpen ? 'rotate-180' : ''
+                      }`}
+                    />
+                  )}
                 </button>
 
-                {/* Sub Items List */}
-                {isOpen && group.children && (
+                {/* Sub Items List (Expanded) */}
+                {!isCollapsed && isOpen && group.children && (
                   <div className="pl-4 pr-1 py-1 space-y-0.5 relative before:absolute before:left-5 before:top-2 before:bottom-2 before:w-[1px] before:bg-slate-800">
                     {group.children.map((child) => {
                       const isSubActive =
@@ -214,7 +246,6 @@ export const Sidebar: React.FC = () => {
                               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40 font-normal'
                           }`}
                         >
-                          {/* Dot indicator matching screenshot */}
                           <span
                             className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                               isSubActive ? 'bg-[#f95700]' : 'bg-slate-600'
@@ -236,10 +267,13 @@ export const Sidebar: React.FC = () => {
       <div className="p-3 border-t border-[#1e2638] bg-[#0c1018]">
         <button
           onClick={logout}
-          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300 transition-colors"
+          title={isCollapsed ? 'Sign Out' : undefined}
+          className={`w-full flex items-center ${
+            isCollapsed ? 'justify-center px-2' : 'gap-2.5 px-3'
+          } py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300 transition-colors`}
         >
-          <LogOut className="w-4 h-4" />
-          <span>Sign Out</span>
+          <LogOut className="w-4 h-4 shrink-0" />
+          {!isCollapsed && <span>Sign Out</span>}
         </button>
       </div>
     </aside>

@@ -182,7 +182,11 @@ class ApiClient {
   // AUTH
   // --------------------------------------------------------------------------
   public async login(employee_id: string, password: string) {
-    const res = await this.client.post('/api/auth/login', { employee_id, password });
+    const res = await this.client.post(
+      '/api/auth/login',
+      { employee_id, password, client_type: 'WEB' },
+      { headers: { 'X-Client-Type': 'WEB' } }
+    );
     return res.data;
   }
 
