@@ -24,6 +24,9 @@ class AuthService {
     await prefs.setString('role', res['role']);
     await prefs.setString('employee_id', res['employee_id']);
     await prefs.setString('full_name', res['full_name']);
+    if (res['user_id'] != null) {
+      await prefs.setInt('user_id', res['user_id'] is int ? res['user_id'] : int.tryParse(res['user_id'].toString()) ?? 0);
+    }
     await prefs.setBool('must_change_password', res['must_change_password'] ?? false);
 
     // Save effective feature toggles

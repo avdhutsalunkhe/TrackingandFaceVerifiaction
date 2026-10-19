@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -221,11 +222,27 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
           _selectedSessionId = session['id'];
           final sessionId = session['id'];
-          final routeRes = await _apiClient.get('/api/tracking/sessions/$sessionId/route');
+          final routeRes = await _apiClient.get('/api/tracking/sessions/$sessionId/route?raw=true');
 
           if (routeRes is Map) {
             final ptsList = (routeRes['points'] ?? routeRes['route_points'] ?? []) as List;
             final serverPoints = ptsList.map((p) => Map<String, dynamic>.from(p)).toList();
+
+            // If pagination was applied, fetch all subsequent pages so entire route is loaded
+            final totalPages = (routeRes['total_pages'] is int) ? routeRes['total_pages'] as int : 1;
+            if (totalPages > 1) {
+              for (int p = 2; p <= totalPages; p++) {
+                try {
+                  final pageRes = await _apiClient.get('/api/tracking/sessions/$sessionId/raw-points?page=$p&limit=${routeRes['limit'] ?? 100}');
+                  if (pageRes is Map && pageRes['points'] is List) {
+                    final morePts = (pageRes['points'] as List).map((item) => Map<String, dynamic>.from(item)).toList();
+                    serverPoints.addAll(morePts);
+                  }
+                } catch (e) {
+                  debugPrint('[EmployeeTravelMap] Error fetching page $p: $e');
+                }
+              }
+            }
 
             // Merge with any un-synced points currently stored in local SQLite cache
             final sessionUuid = (session['session_uuid'] as String?) ?? widget.initialSessionUuid;
@@ -390,21 +407,31 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
   /// Splits route into distinct polylines across gaps (>15 min delay or tracking pause)
   List<Polyline> _buildRoutePolylines() {
-    if (_rawPoints.isEmpty) {
-      if (_routePoints.isNotEmpty) {
-        return [
-          Polyline(
-            points: _routePoints,
-            strokeWidth: 4.5,
-            color: const Color(0xFF1D4ED8),
-          ),
-        ];
-      }
-      return [];
-    }
+    if (_routePoints.isEmpty) return [];
 
     final List<Polyline> lines = [];
     List<LatLng> currentSegment = [];
+
+    void addSegment(List<LatLng> segment) {
+      if (segment.length < 2) return;
+      // 1. Casing polyline for crisp contrast against any map background
+      lines.add(Polyline(
+        points: List<LatLng>.from(segment),
+        strokeWidth: 7.5,
+        color: const Color(0xFF1E3A8A),
+      ));
+      // 2. High-contrast main route polyline
+      lines.add(Polyline(
+        points: List<LatLng>.from(segment),
+        strokeWidth: 4.5,
+        color: const Color(0xFF3B82F6),
+      ));
+    }
+
+    if (_rawPoints.isEmpty) {
+      addSegment(_routePoints);
+      return lines;
+    }
 
     for (int i = 0; i < _rawPoints.length; i++) {
       final pt = _rawPoints[i];
@@ -414,25 +441,15 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       final isGap = pt['is_gap'] == 1 || pt['is_gap'] == true;
 
       if (isGap && currentSegment.isNotEmpty) {
-        if (currentSegment.length >= 2) {
-          lines.add(Polyline(
-            points: List<LatLng>.from(currentSegment),
-            strokeWidth: 4.5,
-            color: const Color(0xFF1D4ED8),
-          ));
-        }
+        addSegment(currentSegment);
         currentSegment = [];
       }
 
       currentSegment.add(coord);
     }
 
-    if (currentSegment.length >= 2) {
-      lines.add(Polyline(
-        points: List<LatLng>.from(currentSegment),
-        strokeWidth: 4.5,
-        color: const Color(0xFF1D4ED8),
-      ));
+    if (currentSegment.isNotEmpty) {
+      addSegment(currentSegment);
     }
 
     return lines;
@@ -562,16 +579,40 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   void _fitRouteBounds() {
     if (_routePoints.isEmpty) return;
     if (_routePoints.length == 1) {
-      _mapController.move(_routePoints.first, 15.0);
+      _mapController.move(_routePoints.first, 17.5);
       return;
     }
     final bounds = LatLngBounds.fromPoints(_routePoints);
-    _mapController.fitCamera(
-      CameraFit.bounds(
-        bounds: bounds,
-        padding: const EdgeInsets.all(50),
-      ),
-    );
+    final latSpan = (bounds.north - bounds.south).abs();
+    final lngSpan = (bounds.east - bounds.west).abs();
+
+    // If points are within a compact area (< ~100m span, common for office/stationary tracking),
+    // expand bounds symmetrically so the route and surroundings are clearly legible without blank tiles.
+    if (latSpan < 0.001 || lngSpan < 0.001) {
+      final center = bounds.center;
+      const pad = 0.0008; // ~90 meters contextual padding
+      final expandedBounds = LatLngBounds(
+        LatLng(center.latitude - pad, center.longitude - pad),
+        LatLng(center.latitude + pad, center.longitude + pad),
+      );
+      _mapController.fitCamera(
+        CameraFit.bounds(
+          bounds: expandedBounds,
+          padding: const EdgeInsets.all(40),
+          maxZoom: 18.0,
+          minZoom: 14.0,
+        ),
+      );
+    } else {
+      _mapController.fitCamera(
+        CameraFit.bounds(
+          bounds: bounds,
+          padding: const EdgeInsets.all(40),
+          maxZoom: 18.0,
+          minZoom: 11.0,
+        ),
+      );
+    }
   }
 
   void _zoomIn() {
@@ -588,13 +629,26 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     );
   }
 
+  /// Parses UTC timestamp and converts accurately to Indian Standard Time (Asia/Kolkata, UTC+5:30)
   String _formatTime(dynamic iso) {
     if (iso == null || '$iso'.isEmpty) return '--:--';
     try {
-      final dt = DateTime.parse('$iso').toLocal();
+      final str = '$iso'.trim();
+      DateTime dt;
+      if (str.endsWith('Z') || str.contains('+')) {
+        dt = DateTime.parse(str).toUtc().add(const Duration(hours: 5, minutes: 30));
+      } else {
+        // Assume stored as UTC if naive
+        dt = DateTime.parse('${str}Z').toUtc().add(const Duration(hours: 5, minutes: 30));
+      }
       return DateFormat('hh:mm a').format(dt);
     } catch (_) {
-      return '$iso';
+      try {
+        final dt = DateTime.parse('$iso');
+        return DateFormat('hh:mm a').format(dt);
+      } catch (_) {
+        return '$iso';
+      }
     }
   }
 
@@ -833,10 +887,23 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
   // C. Travel Summary Section
   Widget _buildTravelSummarySection() {
-    final distMeters = _sessionDetail?['total_distance_meters'];
-    final distanceKm = distMeters != null
-        ? ((distMeters as num) / 1000.0).toStringAsFixed(2)
-        : '0.00';
+    // 1. Calculate actual consecutive geodesic distance from raw points
+    double distMeters = 0.0;
+    if (_rawPoints.length > 1) {
+      for (int i = 0; i < _rawPoints.length - 1; i++) {
+        final p1 = _rawPoints[i];
+        final p2 = _rawPoints[i + 1];
+        distMeters += Geolocator.distanceBetween(
+          (p1['latitude'] as num).toDouble(),
+          (p1['longitude'] as num).toDouble(),
+          (p2['latitude'] as num).toDouble(),
+          (p2['longitude'] as num).toDouble(),
+        );
+      }
+    } else if (_sessionDetail?['total_distance_meters'] != null) {
+      distMeters = (_sessionDetail!['total_distance_meters'] as num).toDouble();
+    }
+    final distanceKm = (distMeters / 1000.0).toStringAsFixed(2);
 
     final totalPoints = _rawPoints.isNotEmpty
         ? _rawPoints.length
@@ -846,11 +913,27 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     final isCompleted = status == 'COMPLETED';
     final isActive = status == 'ACTIVE' || status == 'RECORDING';
 
-    final startTimeStr = _formatTime(_sessionDetail?['start_time']);
-    final endTimeStr = _formatTime(_sessionDetail?['end_time']);
+    // 2. Start Time and End Time directly from earliest and latest chronological points
+    dynamic startIso = _rawPoints.isNotEmpty ? _rawPoints.first['recorded_at'] : _sessionDetail?['start_time'];
+    dynamic endIso = _rawPoints.isNotEmpty ? _rawPoints.last['recorded_at'] : _sessionDetail?['end_time'];
 
-    final formattedDate = DateFormat('dd MMM yyyy').format(_selectedDate);
-    final dayOfWeek = DateFormat('EEEE').format(_selectedDate);
+    final startTimeStr = _formatTime(startIso);
+    final endTimeStr = _formatTime(endIso);
+
+    // 3. Derive Tracking Date from earliest point if available
+    DateTime displayDate = _selectedDate;
+    if (_rawPoints.isNotEmpty && _rawPoints.first['recorded_at'] != null) {
+      try {
+        final rawStr = '${_rawPoints.first['recorded_at']}'.trim();
+        final rawUtc = rawStr.endsWith('Z') || rawStr.contains('+')
+            ? DateTime.parse(rawStr).toUtc()
+            : DateTime.parse('${rawStr}Z').toUtc();
+        displayDate = rawUtc.add(const Duration(hours: 5, minutes: 30));
+      } catch (_) {}
+    }
+
+    final formattedDate = DateFormat('dd MMM yyyy').format(displayDate);
+    final dayOfWeek = DateFormat('EEEE').format(displayDate);
 
     return Container(
       width: double.infinity,
@@ -1375,140 +1458,194 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                           );
                         }).whereType<CircleMarker>().toList(),
                       ),
-                    // Markers: Fixed Start, Dynamic Moving Marker, End Marker
+                    // Markers: Fixed Start, Dynamic Moving Marker, End Marker, and Checkpoints
                     if (_routePoints.isNotEmpty)
-                      MarkerLayer(
-                        markers: [
-                          // 1. Fixed Start Marker (always at original session origin)
-                          Marker(
-                            point: _routePoints.first,
-                            width: 70,
-                            height: 60,
-                            child: GestureDetector(
-                              onTap: () => _showPointDetails(0),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF10B981),
-                                      borderRadius: BorderRadius.circular(6),
+                      Builder(
+                        builder: (context) {
+                          final isStartEndNear = _routePoints.length > 1 &&
+                              Geolocator.distanceBetween(
+                                _routePoints.first.latitude,
+                                _routePoints.first.longitude,
+                                _routePoints.last.latitude,
+                                _routePoints.last.longitude,
+                              ) < 25.0;
+
+                          return MarkerLayer(
+                            markers: [
+                              // 0. Individual clickable Checkpoint Dots when Show Points is active
+                              if (_showPoints && _routePoints.length > 2)
+                                ...List.generate(_routePoints.length - 2, (i) {
+                                  final ptIdx = i + 1;
+                                  return Marker(
+                                    point: _routePoints[ptIdx],
+                                    width: 22,
+                                    height: 22,
+                                    child: GestureDetector(
+                                      onTap: () => _showPointDetails(ptIdx),
+                                      child: Tooltip(
+                                        message: 'Point #${ptIdx + 1}: ${_formatTime(_rawPoints.isNotEmpty ? _rawPoints[ptIdx]['recorded_at'] : null)}',
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF2563EB),
+                                            shape: BoxShape.circle,
+                                            border: Border.all(color: Colors.white, width: 2),
+                                            boxShadow: const [
+                                              BoxShadow(color: Colors.black26, blurRadius: 3),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
                                     ),
-                                    child: const Text(
-                                      'Start',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.bold,
+                                  );
+                                }),
+
+                              // 1. Fixed Start Marker (with horizontal offset if Start and End coincide)
+                              Marker(
+                                point: _routePoints.first,
+                                width: 85,
+                                height: 65,
+                                alignment: isStartEndNear ? Alignment.centerLeft : Alignment.topCenter,
+                                child: Transform.translate(
+                                  offset: isStartEndNear ? const Offset(-25, 0) : Offset.zero,
+                                  child: GestureDetector(
+                                    onTap: () => _showPointDetails(0),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF10B981),
+                                            borderRadius: BorderRadius.circular(6),
+                                            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+                                          ),
+                                          child: const Text(
+                                            'START',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
+                                              letterSpacing: 0.5,
+                                            ),
+                                          ),
+                                        ),
+                                        const Icon(Icons.location_on_rounded, color: Color(0xFF10B981), size: 32),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+
+                              // 2. Playback moving marker
+                              if (_isPlaying && _playbackIndex < _routePoints.length)
+                                Marker(
+                                  point: _routePoints[_playbackIndex],
+                                  width: 80,
+                                  height: 70,
+                                  child: GestureDetector(
+                                    onTap: () => _showPointDetails(_playbackIndex),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF4F46E5),
+                                            borderRadius: BorderRadius.circular(6),
+                                            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+                                          ),
+                                          child: Text(
+                                            'Pt #${_playbackIndex + 1}',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        const Icon(Icons.navigation_rounded, color: Color(0xFF4F46E5), size: 32),
+                                      ],
+                                    ),
+                                  ),
+                                )
+                              // 3. Live Moving Location Marker (when session is active and not playing back)
+                              else if ((_sessionDetail?['status'] == 'RECORDING' || _sessionDetail?['status'] == 'ACTIVE') && _routePoints.isNotEmpty)
+                                Marker(
+                                  point: _routePoints.last,
+                                  width: 80,
+                                  height: 70,
+                                  child: GestureDetector(
+                                    onTap: () => _showPointDetails(_routePoints.length - 1),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF2563EB),
+                                            borderRadius: BorderRadius.circular(6),
+                                            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+                                          ),
+                                          child: const Text(
+                                            'Current GPS',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        Stack(
+                                          alignment: Alignment.center,
+                                          children: const [
+                                            Icon(Icons.trip_origin_rounded, color: Color(0xFF93C5FD), size: 34),
+                                            Icon(Icons.circle, color: Color(0xFF1D4ED8), size: 16),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                )
+                              // 4. Completed End Marker (with horizontal offset if Start and End coincide)
+                              else if (_routePoints.length > 1)
+                                Marker(
+                                  point: _routePoints.last,
+                                  width: 85,
+                                  height: 65,
+                                  alignment: isStartEndNear ? Alignment.centerRight : Alignment.topCenter,
+                                  child: Transform.translate(
+                                    offset: isStartEndNear ? const Offset(25, 0) : Offset.zero,
+                                    child: GestureDetector(
+                                      onTap: () => _showPointDetails(_routePoints.length - 1),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFFDC2626),
+                                              borderRadius: BorderRadius.circular(6),
+                                              boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+                                            ),
+                                            child: const Text(
+                                              'END',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                                letterSpacing: 0.5,
+                                              ),
+                                            ),
+                                          ),
+                                          const Icon(Icons.location_on_rounded, color: Color(0xFFDC2626), size: 32),
+                                        ],
                                       ),
                                     ),
                                   ),
-                                  const Icon(Icons.location_on_rounded, color: Color(0xFF10B981), size: 30),
-                                ],
-                              ),
-                            ),
-                          ),
-                          // 2. Playback moving marker
-                          if (_isPlaying && _playbackIndex < _routePoints.length)
-                            Marker(
-                              point: _routePoints[_playbackIndex],
-                              width: 80,
-                              height: 70,
-                              child: GestureDetector(
-                                onTap: () => _showPointDetails(_playbackIndex),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF4F46E5),
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: Text(
-                                        'Pt #${_playbackIndex + 1}',
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                    ),
-                                    const Icon(Icons.navigation_rounded, color: Color(0xFF4F46E5), size: 32),
-                                  ],
                                 ),
-                              ),
-                            )
-                          // 3. Live Moving Location Marker (when session is active and not playing back)
-                          else if ((_sessionDetail?['status'] == 'RECORDING' || _sessionDetail?['status'] == 'ACTIVE') && _routePoints.isNotEmpty)
-                            Marker(
-                              point: _routePoints.last,
-                              width: 80,
-                              height: 70,
-                              child: GestureDetector(
-                                onTap: () => _showPointDetails(_routePoints.length - 1),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF2563EB),
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: const Text(
-                                        'Current GPS',
-                                        style: TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                    ),
-                                    Stack(
-                                      alignment: Alignment.center,
-                                      children: const [
-                                        Icon(Icons.trip_origin_rounded, color: Color(0xFF93C5FD), size: 34),
-                                        Icon(Icons.circle, color: Color(0xFF1D4ED8), size: 16),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            )
-                          // 4. Completed End Marker
-                          else if (_routePoints.length > 1)
-                            Marker(
-                              point: _routePoints.last,
-                              width: 70,
-                              height: 60,
-                              child: GestureDetector(
-                                onTap: () => _showPointDetails(_routePoints.length - 1),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    const Icon(Icons.location_on_rounded, color: Color(0xFFDC2626), size: 30),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFFDC2626),
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: const Text(
-                                        'End',
-                                        style: TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                        ],
+                            ],
+                          );
+                        },
                       ),
                   ],
                 ),

@@ -93,6 +93,50 @@ class TrackingService with ChangeNotifier {
   final StreamController<Map<String, dynamic>> _addressStreamController = StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get addressStream => _addressStreamController.stream;
 
+  /// Transparently initialize and start/schedule automatic background GPS tracking
+  /// without requiring manual confirmation dialogs or button clicks from the employee.
+  Future<void> initializeAutomaticDailyTracking({
+    required int userId,
+    required String employeeId,
+    bool is24x7 = true,
+    String startTime = '08:00',
+    String endTime = '18:00',
+    String timezone = 'Asia/Kolkata',
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final travelMapEnabled = prefs.getBool('travel_map_enabled') ?? true;
+    if (!travelMapEnabled) {
+      debugPrint('[TrackingService] travel_map_enabled is false. Automatic tracking disabled.');
+      return;
+    }
+
+    await prefs.setInt('user_id', userId);
+    await prefs.setString('employee_id', employeeId);
+    await prefs.setBool('tracking_mode_24x7', is24x7);
+    await prefs.setString('tracking_schedule_start', startTime);
+    await prefs.setString('tracking_schedule_end', endTime);
+    await prefs.setString('tracking_timezone', timezone);
+
+    // Request permissions and battery optimizations transparently in background
+    await _verifyLocationPrerequisites();
+    await NativeBackgroundTracking.requestBatteryOptimizationExemption();
+
+    // Configure native Android scheduler (evaluates schedule & starts service if in window)
+    await NativeBackgroundTracking.scheduleTracking(
+      userId: userId,
+      is24x7: is24x7,
+      startTime: startTime,
+      endTime: endTime,
+      timezone: timezone,
+    );
+
+    // Start background sync timer for offline SQLite points
+    _listenToNativeEvents();
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) => syncPendingPoints());
+    syncPendingPoints();
+  }
+
   /// Start automatic tracking right after login upon user confirmation
   Future<void> startTrackingForLogin({
     required int userId,
@@ -536,6 +580,27 @@ class TrackingService with ChangeNotifier {
       isGap: filterResult.isGap,
     );
 
+    // Persist every valid raw GPS point into local database as authoritative source of truth
+    final clientPointId = '${_activeSessionUuid}_pt_${seq}_${timestamp.millisecondsSinceEpoch}';
+    try {
+      await _db.insertPoint({
+        'session_uuid': _activeSessionUuid!,
+        'client_point_id': clientPointId,
+        'sequence_number': seq,
+        'latitude': pos.latitude,
+        'longitude': pos.longitude,
+        'accuracy_meters': pos.accuracy,
+        'altitude_meters': pos.altitude != 0 ? pos.altitude : null,
+        'speed_mps': pos.speed >= 0 ? pos.speed : null,
+        'bearing_degrees': pos.heading >= 0 ? pos.heading : null,
+        'recorded_at': timestamp.toUtc().toIso8601String(),
+        'is_gap': filterResult.isGap ? 1 : 0,
+        'sync_status': 'PENDING',
+      });
+    } catch (e) {
+      debugPrint('[TrackingService] Error caching raw point to SQLite: $e');
+    }
+
     // Always emit to live map stream so user sees their immediate position
     _pointStreamController.add(vertex.toMap(sessionUuid: _activeSessionUuid!, sequenceNumber: seq));
 
@@ -546,6 +611,9 @@ class TrackingService with ChangeNotifier {
       _candidateVertices.add(vertex);
       debugPrint('[GPS-PIPE][STAGE 4] Retained candidate vertex #${_candidateVertices.length} (seq=$seq, spd=${pos.speed}m/s)');
       await _flushChunkIfNeeded(force: false);
+    } else {
+      // Periodic trigger for raw points sync when candidate is stationary/heartbeat
+      syncPendingPoints();
     }
   }
 

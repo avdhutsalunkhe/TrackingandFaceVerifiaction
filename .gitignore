@@ -1,15 +1,20 @@
 # ==========================================
-# Excluded Backend & Backend Services (Per User Request)
+# Backend Exclusions & Runtime Artifacts
 # ==========================================
-backend/
 backend.zip
 backend_server_updates.md
 start_all_services.bat
-docker-compose.yml
 _backups_pre_gps_fix/
 .pytest_cache/
 **/__pycache__/
 *.pyc
+*.pyo
+backend/venv/
+backend/.env
+backend/*.db
+backend/logs/
+backend/exports/
+backend/.pytest_cache/
 
 # ==========================================
 # Large Binaries, Archives & Distribution

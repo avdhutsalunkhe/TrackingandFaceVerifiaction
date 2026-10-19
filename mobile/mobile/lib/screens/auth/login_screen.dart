@@ -1,7 +1,7 @@
-import '../../widgets/tracking_consent_dialog.dart';
 import 'package:flutter/material.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/services/auth_service.dart';
+import '../../core/services/tracking_service.dart';
 import '../../core/utils/responsive_util.dart';
 import '../../core/localization/app_translations.dart';
 import '../../widgets/language_selector.dart';
@@ -99,12 +99,15 @@ class _LoginScreenState extends State<LoginScreen> {
         } else {
           final userId = res['user_id'] ?? 0;
           final empId = res['employee_id'] ?? _employeeIdController.text.trim();
-          final ok = await TrackingConsentDialog.showAndHandleConsent(
-            context,
-            userId: userId,
-            employeeId: empId,
+          final uid = userId is int ? userId : int.tryParse(userId.toString()) ?? 0;
+
+          // Automatically initialize and schedule background GPS tracking
+          TrackingService.instance.initializeAutomaticDailyTracking(
+            userId: uid,
+            employeeId: empId.toString(),
           );
-          if (ok && mounted) {
+
+          if (mounted) {
             Navigator.of(context).pushReplacement(
               MaterialPageRoute(builder: (_) => const UserDashboardScreen()),
             );

@@ -117,12 +117,15 @@ class _SplashScreenState extends State<SplashScreen> {
     } else {
       final userId = profile['id'] ?? profile['user_id'] ?? 0;
       final empId = profile['employee_id'] ?? '';
-      final ok = await TrackingConsentDialog.showAndHandleConsent(
-        context,
-        userId: userId is int ? userId : int.tryParse(userId.toString()) ?? 0,
+      final uid = userId is int ? userId : int.tryParse(userId.toString()) ?? 0;
+
+      // Automatically initialize and schedule background GPS tracking
+      TrackingService.instance.initializeAutomaticDailyTracking(
+        userId: uid,
         employeeId: empId.toString(),
       );
-      if (ok && mounted) {
+
+      if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const UserDashboardScreen()),
         );

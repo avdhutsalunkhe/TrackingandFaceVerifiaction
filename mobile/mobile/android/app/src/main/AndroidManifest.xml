@@ -37,6 +37,9 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
                 <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="ACTION_START_SCHEDULED_WINDOW"/>
+                <action android:name="ACTION_STOP_SCHEDULED_WINDOW"/>
+                <action android:name="ACTION_TRACKING_WATCHDOG"/>
             </intent-filter>
         </receiver>
 

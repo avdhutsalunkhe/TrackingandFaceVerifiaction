@@ -145,7 +145,19 @@ class TrackingForegroundService : Service(), LocationListener {
         }
     }
 
-    private fun startForegroundWithNotification(contentText: String) {
+    private fun buildNotification(status: String, detailText: String? = null, accuracyMeters: Float? = null): Notification {
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val is24x7 = prefs.getBoolean("flutter.tracking_mode_24x7", true)
+        val startTimeStr = prefs.getString("flutter.tracking_schedule_start", "08:00 AM") ?: "08:00 AM"
+        val endTimeStr = prefs.getString("flutter.tracking_schedule_end", "06:00 PM") ?: "06:00 PM"
+        val scheduleDisplay = if (is24x7) "24*7 Continuous" else "$startTimeStr – $endTimeStr"
+
+        val timeFormat = SimpleDateFormat("hh:mm a", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("Asia/Kolkata")
+        }
+        val lastFixStr = if (lastFixTimeMs > 0L) timeFormat.format(Date(lastFixTimeMs)) else "Acquiring fix..."
+        val distKm = totalDistanceMeters / 1000.0
+
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -156,16 +168,36 @@ class TrackingForegroundService : Service(), LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("FieldStaff Journey Tracking Active")
+        val contentText = when (status) {
+            "Active" -> "Schedule: $scheduleDisplay • Last GPS: $lastFixStr"
+            "Interrupted" -> detailText ?: "Location permissions or GPS unavailable"
+            "Paused" -> "Tracking paused • %.2f km".format(distKm)
+            else -> detailText ?: "Duty GPS Tracking"
+        }
+
+        val accuracyStr = if (accuracyMeters != null) " (±${accuracyMeters.toInt()}m)" else ""
+        val bigText = """
+            Status: $status
+            Schedule: $scheduleDisplay
+            Last GPS update: $lastFixStr$accuracyStr
+            Total Travel: %.2f km
+        """.trimIndent().format(distKm)
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Field Duty Tracking")
             .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setOngoing(true)
+            .setOngoing(status == "Active" || status == "Interrupted")
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setOnlyAlertOnce(true)
             .build()
+    }
 
+    private fun startForegroundWithNotification(contentText: String) {
+        val notification = buildNotification(status = "Active", detailText = contentText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         } else {
@@ -173,29 +205,9 @@ class TrackingForegroundService : Service(), LocationListener {
         }
     }
 
-    private fun updateNotification(distanceKm: Double, accuracyMeters: Float) {
-        val text = "Recorded %.2f km • Accuracy: ±%.0fm".format(distanceKm, accuracyMeters)
+    private fun updateNotification(status: String = "Active", detailText: String? = null, accuracyMeters: Float? = null) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            launchIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("FieldStaff Journey Tracking Active")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setOngoing(true)
-            .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-
+        val notification = buildNotification(status, detailText, accuracyMeters)
         manager.notify(NOTIFICATION_ID, notification)
     }
 
@@ -392,7 +404,7 @@ class TrackingForegroundService : Service(), LocationListener {
         )
 
         // Update notification with new status
-        updateNotification(totalDistanceMeters / 1000.0, accuracy)
+        updateNotification(status = "Active", accuracyMeters = accuracy)
 
         // Stage 4: Forward to Flutter live stream if engine is attached
         val pointMap = mapOf<String, Any?>(
@@ -503,6 +515,8 @@ class TrackingForegroundService : Service(), LocationListener {
         if (activeUuid != null && isServiceRunning) {
             Log.i(TAG, "App swiped from Recents, but session $activeUuid is ACTIVE. Maintaining service.")
 
+            TrackingScheduler.evaluateAndSchedule(applicationContext)
+
             // Set restart alarm in case system aggressive task killers kill the process
             val restartIntent = Intent(applicationContext, TrackingForegroundService::class.java).apply {
                 action = ACTION_START
@@ -539,11 +553,13 @@ class TrackingForegroundService : Service(), LocationListener {
 
     override fun onProviderEnabled(provider: String) {
         Log.i(TAG, "Provider enabled: $provider")
+        updateNotification(status = "Active", detailText = "Location provider $provider enabled")
         broadcastHealthEvent("GPS_RESTORED", "Location provider $provider enabled")
     }
 
     override fun onProviderDisabled(provider: String) {
         Log.w(TAG, "Provider disabled: $provider")
+        updateNotification(status = "Interrupted", detailText = "Location provider $provider disabled by user")
         broadcastHealthEvent("GPS_DISABLED", "Location provider $provider disabled by user")
     }
 

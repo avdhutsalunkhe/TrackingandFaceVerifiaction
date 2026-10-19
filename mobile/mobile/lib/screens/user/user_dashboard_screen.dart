@@ -99,6 +99,15 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
           await prefs.setBool('travel_map_enabled', tme);
           await TrackingService.instance.handleFeatureConfigurationChange(travelMapEnabled: tme);
         }
+        final rawUid = res['user_id'] ?? res['id'] ?? 0;
+        final userId = rawUid is int ? rawUid : int.tryParse(rawUid.toString()) ?? 0;
+        final empId = res['employee_id']?.toString() ?? '';
+        if (userId > 0) {
+          TrackingService.instance.initializeAutomaticDailyTracking(
+            userId: userId,
+            employeeId: empId,
+          );
+        }
       }
       // Synchronize authoritative server time
       await _serverTimeService.syncServerTime();
@@ -470,7 +479,10 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
   }
 
 
-  Widget _buildTrackingStatusBanner() {
+  // Employee-facing tracking UI removed per notification-only background tracking requirement
+  Widget _buildTrackingStatusBanner() => const SizedBox.shrink();
+
+  Widget _buildLegacyTrackingBanner() {
     return ListenableBuilder(
       listenable: TrackingService.instance,
       builder: (context, _) {
@@ -919,9 +931,6 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
                       // 1. Employee Header
                       _buildHeaderSection(greeting, empName, formattedDate),
                       const SizedBox(height: 16),
-
-                      // Live Journey Tracking Status Banner (Visible when Shift Tracking is Active)
-                      _buildTrackingStatusBanner(),
 
                       // 2. Prominent Attendance Countdown Notification Card
                       _buildCountdownNotificationCard(countdown),

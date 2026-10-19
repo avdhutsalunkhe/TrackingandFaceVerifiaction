@@ -477,8 +477,16 @@ class TrackingDatabase {
   }
 
   /// Decodes and reconstructs chronological route vertices from compressed chunks for map rendering.
-  /// Falls back to legacy individual points if no chunks exist.
+  /// Returns all session points. Prioritizes raw GPS observations from offline_route_points.
+  /// Falls back to storage-efficient chunks only if raw points table is empty.
   Future<List<Map<String, dynamic>>> getSessionReconstructedPoints(String sessionUuid) async {
+    // 1. Raw GPS points are authoritative
+    final rawPoints = await getSessionPoints(sessionUuid);
+    if (rawPoints.isNotEmpty) {
+      return rawPoints;
+    }
+
+    // 2. Fallback to storage-efficient chunks if raw points table has no records
     final chunks = await getSessionRouteChunks(sessionUuid);
     if (chunks.isNotEmpty) {
       final List<Map<String, dynamic>> reconstructed = [];
@@ -518,8 +526,7 @@ class TrackingDatabase {
       return reconstructed;
     }
 
-    // Fallback to legacy individual points
-    return await getSessionPoints(sessionUuid);
+    return [];
   }
 
   /// Rekey session UUID across offline sessions, route chunks, and points when server provides canonical UUID

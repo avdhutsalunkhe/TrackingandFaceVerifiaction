@@ -93,6 +93,42 @@ class NativeBackgroundTracking {
     }
   }
 
+  /// Configures native daily schedule or 24*7 continuous tracking
+  static Future<bool> scheduleTracking({
+    required int userId,
+    bool is24x7 = true,
+    String startTime = '08:00',
+    String endTime = '18:00',
+    String timezone = 'Asia/Kolkata',
+  }) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return true;
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('scheduleTracking', {
+        'user_id': userId,
+        'is_24x7': is24x7,
+        'start_time': startTime,
+        'end_time': endTime,
+        'timezone': timezone,
+      });
+      return res ?? false;
+    } catch (e) {
+      debugPrint('[NativeBackgroundTracking] scheduleTracking error: $e');
+      return false;
+    }
+  }
+
+  /// Triggers immediate schedule evaluation (starts service if in window)
+  static Future<bool> evaluateSchedule() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return true;
+    try {
+      final res = await _methodChannel.invokeMethod<bool>('evaluateSchedule');
+      return res ?? false;
+    } catch (e) {
+      debugPrint('[NativeBackgroundTracking] evaluateSchedule error: $e');
+      return false;
+    }
+  }
+
   /// Requests the user to disable battery optimization for continuous background tracking
   static Future<void> requestBatteryOptimizationExemption() async {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;

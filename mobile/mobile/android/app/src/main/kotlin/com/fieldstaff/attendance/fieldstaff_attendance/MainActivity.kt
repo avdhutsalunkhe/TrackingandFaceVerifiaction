@@ -72,6 +72,29 @@ class MainActivity : FlutterActivity() {
                 "isServiceRunning" -> {
                     result.success(TrackingForegroundService.isServiceRunning)
                 }
+                "scheduleTracking" -> {
+                    val userId = call.argument<Int>("user_id") ?: 0
+                    val is24x7 = call.argument<Boolean>("is_24x7") ?: true
+                    val startTime = call.argument<String>("start_time") ?: "08:00"
+                    val endTime = call.argument<String>("end_time") ?: "18:00"
+                    val timezone = call.argument<String>("timezone") ?: "Asia/Kolkata"
+
+                    val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                    prefs.edit()
+                        .putLong("flutter.user_id", userId.toLong())
+                        .putBoolean("flutter.tracking_mode_24x7", is24x7)
+                        .putString("flutter.tracking_schedule_start", startTime)
+                        .putString("flutter.tracking_schedule_end", endTime)
+                        .putString("flutter.tracking_timezone", timezone)
+                        .apply()
+
+                    TrackingScheduler.evaluateAndSchedule(this)
+                    result.success(true)
+                }
+                "evaluateSchedule" -> {
+                    TrackingScheduler.evaluateAndSchedule(this)
+                    result.success(true)
+                }
                 "isBatteryOptimizationIgnored" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
