@@ -210,12 +210,12 @@ class GpsDistanceCalculator {
     double? speedMps,
     bool isResumedAfterPause = false,
   }) {
-    // Stage 1: Coordinate validity
+    // Stage 1: Boundary & Sentinel Check (NaN, Infinite, out-of-bounds, Null Island)
     if (!isValidCoordinate(latitude, longitude)) {
       return GpsFilterResult.rejected('Invalid coordinate bounds ($latitude, $longitude)');
     }
 
-    // Stage 2: Accuracy threshold
+    // Stage 2: Accuracy Threshold Gate (Discard cell-tower jumps > 65m)
     if (accuracyMeters > maxAllowedAccuracyMeters) {
       return GpsFilterResult.rejected(
         'Accuracy too low (${accuracyMeters.toStringAsFixed(1)}m > ${maxAllowedAccuracyMeters.toStringAsFixed(1)}m)',
@@ -244,7 +244,7 @@ class GpsDistanceCalculator {
     final elapsedMs = timestamp.difference(_lastFixTimestamp!).inMilliseconds.abs();
     final elapsedSeconds = elapsedMs / 1000.0;
 
-    // Stage 3: Gap detection (> 15 mins or explicit pause resumption)
+    // Stage 3: Discontinuous Gap Detection (> 15 mins or explicit pause resumption)
     if (isResumedAfterPause || elapsedSeconds > gapDurationSeconds) {
       _distanceReferencePosition = currentCoord;
       _lastReferenceTimestamp = timestamp;
@@ -253,9 +253,7 @@ class GpsDistanceCalculator {
       return GpsFilterResult.acceptedWithDistance(0.0, isGap: true);
     }
 
-    // Stage 4: Teleportation / GPS glitch detection
-    // Note: Implied speed MUST be computed over the step from the immediately preceding fix
-    // (_lastFixPosition), NOT the cumulative displacement from the dead-reckoning reference position!
+    // Stage 4: Teleportation & Glitch Detection (Implied Speed Check: > 55 m/s ≈ 198 km/h)
     if (elapsedSeconds > 0.5 && stepDisplacement > 40.0) {
       final impliedSpeed = stepDisplacement / elapsedSeconds;
       if (impliedSpeed > maxImpliedSpeedMps) {
@@ -269,7 +267,7 @@ class GpsDistanceCalculator {
     _lastFixPosition = currentCoord;
     _lastFixTimestamp = timestamp;
 
-    // Stage 5: Movement threshold check for distance dead-reckoning accumulation
+    // Stage 5: Stationary Drift Suppression (Dead-Reckoning Threshold)
     final displacementFromRef = haversineDistanceMeters(
       _distanceReferencePosition!.latitude,
       _distanceReferencePosition!.longitude,
@@ -277,15 +275,65 @@ class GpsDistanceCalculator {
       currentCoord.longitude,
     );
 
+    // Suppress stationary wander when speed < 0.4 m/s and displacement < 4.0m
+    if (speedMps != null && speedMps < 0.4 && displacementFromRef < 4.0) {
+      return GpsFilterResult.acceptedNoDistance;
+    }
+
+    // Enforce minimum movement threshold of 8 meters before distance is committed
     if (displacementFromRef >= minMovementThresholdMeters) {
       _distanceReferencePosition = currentCoord;
       _lastReferenceTimestamp = timestamp;
       return GpsFilterResult.acceptedWithDistance(displacementFromRef);
     }
 
-    // Small movement (< minMovementThresholdMeters):
+    // Sub-threshold movement (< minMovementThresholdMeters):
     // Accepted as a valid route point so high-fidelity trajectory is maintained,
     // but distance accumulation waits until movement crosses the threshold to avoid stationary jitter.
     return GpsFilterResult.acceptedNoDistance;
   }
+
+  /// Static helper evaluating candidate vertex retention against stationary, turn, and heartbeat criteria
+  static VertexRetentionDecision evaluateVertex({
+    required double candLat,
+    required double candLng,
+    required DateTime candTimestamp,
+    double? candSpeedMps,
+    double? candBearingDegrees,
+    required double lastAcceptedLat,
+    required double lastAcceptedLng,
+    required DateTime lastAcceptedTime,
+    double? lastAcceptedBearing,
+  }) {
+    final displacement = haversineDistanceMeters(lastAcceptedLat, lastAcceptedLng, candLat, candLng);
+    final elapsedSeconds = candTimestamp.difference(lastAcceptedTime).inSeconds.abs();
+
+    final isStationary = (candSpeedMps != null && candSpeedMps < 0.4 && displacement < 4.0) || (displacement < 2.5);
+    if (isStationary) {
+      if (elapsedSeconds >= 120) {
+        return const VertexRetentionDecision(true, 'Heartbeat checkpoint (>=120s dwell)');
+      }
+      return const VertexRetentionDecision(false, 'Stationary suppression (<4m / <0.4m/s)');
+    }
+
+    if (lastAcceptedBearing != null && candBearingDegrees != null) {
+      double angleDiff = (candBearingDegrees - lastAcceptedBearing).abs() % 360.0;
+      if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
+      if (angleDiff >= 12.0 && displacement >= 4.0) {
+        return VertexRetentionDecision(true, 'Turn detected (${angleDiff.toStringAsFixed(1)} deg >= 12 deg)');
+      }
+    }
+
+    if (displacement >= 8.0) {
+      return VertexRetentionDecision(true, 'Movement threshold (${displacement.toStringAsFixed(1)}m >= 8m)');
+    }
+
+    return const VertexRetentionDecision(false, 'Sub-threshold movement');
+  }
+}
+
+class VertexRetentionDecision {
+  final bool shouldRetain;
+  final String reason;
+  const VertexRetentionDecision(this.shouldRetain, this.reason);
 }

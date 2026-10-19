@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../models/coordinate_point_model.dart';
 import '../../network/api_client.dart';
 import 'tracking_database.dart';
 import 'notification_service.dart';
@@ -26,6 +27,7 @@ class TrackingService with ChangeNotifier {
   final ApiClient _apiClient = ApiClient();
   final TrackingDatabase _db = TrackingDatabase.instance;
   final GpsDistanceCalculator _distanceCalculator = GpsDistanceCalculator();
+  final KalmanLatLongFilter _kalmanFilter = KalmanLatLongFilter(qMetersPerSecond: 3.0);
 
   StreamSubscription<Position>? _positionSub;
   StreamSubscription<Map<String, dynamic>>? _nativeEventSub;
@@ -238,11 +240,23 @@ class TrackingService with ChangeNotifier {
       );
       _lastRecordedTime = DateTime.parse(lastPt['recorded_at'] as String);
       _distanceCalculator.restoreReference(_lastRecordedPosition, _lastRecordedTime);
+      _kalmanFilter.reset(
+        _lastRecordedPosition!.latitude,
+        _lastRecordedPosition!.longitude,
+        10.0,
+        _lastRecordedTime?.millisecondsSinceEpoch,
+      );
     } else if (startLat != null && startLng != null) {
       _startPosition = LatLng(startLat, startLng);
       _lastRecordedPosition = _startPosition;
       _lastRecordedTime = initialFix?.timestamp.toUtc() ?? DateTime.now().toUtc();
       _distanceCalculator.restoreReference(_startPosition, _lastRecordedTime);
+      _kalmanFilter.reset(
+        startLat,
+        startLng,
+        initialFix?.accuracy ?? 10.0,
+        _lastRecordedTime?.millisecondsSinceEpoch,
+      );
     }
 
     _currentAccuracy = initialFix?.accuracy ?? (startLat != null ? 10.0 : null);
@@ -522,10 +536,23 @@ class TrackingService with ChangeNotifier {
     final timestamp = pos.timestamp.toUtc();
     debugPrint('[GPS-PIPE][STAGE 1] Location produced (poll=$isLivePoll): lat=${pos.latitude}, lng=${pos.longitude}, acc=${pos.accuracy}m, spd=${pos.speed}m/s');
 
-    final filterResult = _distanceCalculator.processFix(
+    // 1. 2D Kalman Filtering: eliminate raw sensor noise and coordinate jitter
+    final filtered = _kalmanFilter.process(
       latitude: pos.latitude,
       longitude: pos.longitude,
-      accuracyMeters: pos.accuracy,
+      accuracy: pos.accuracy,
+      timestampMs: timestamp.millisecondsSinceEpoch,
+      altitude: pos.altitude != 0 ? pos.altitude : null,
+      speed: pos.speed >= 0 ? pos.speed : null,
+    );
+
+    final safeFilteredAccuracy = filtered.accuracy ?? pos.accuracy;
+
+    // 2. Multi-Stage Anomaly Filtering (5-stage gate)
+    final filterResult = _distanceCalculator.processFix(
+      latitude: filtered.latitude,
+      longitude: filtered.longitude,
+      accuracyMeters: safeFilteredAccuracy,
       timestamp: timestamp,
       speedMps: pos.speed >= 0 ? pos.speed : null,
       isResumedAfterPause: _isResumedAfterPause,
@@ -543,8 +570,8 @@ class TrackingService with ChangeNotifier {
     debugPrint('[GPS-PIPE][STAGE 3] Fix accepted: +${filterResult.distanceAddedMeters.toStringAsFixed(1)}m, gap=${filterResult.isGap}');
 
     _gpsError = null;
-    _currentAccuracy = pos.accuracy;
-    _lastRecordedPosition = LatLng(pos.latitude, pos.longitude);
+    _currentAccuracy = safeFilteredAccuracy;
+    _lastRecordedPosition = LatLng(filtered.latitude, filtered.longitude);
     _lastRecordedTime = timestamp;
 
     if (filterResult.distanceAddedMeters > 0.0) {
@@ -561,8 +588,8 @@ class TrackingService with ChangeNotifier {
     // Every 3s observation contributes to cumulative distance above,
     // but only geometrically meaningful vertices are retained into permanent route chunks.
     final shouldRetain = _distanceCalculator.shouldRetainCandidateVertex(
-      latitude: pos.latitude,
-      longitude: pos.longitude,
+      latitude: filtered.latitude,
+      longitude: filtered.longitude,
       timestamp: timestamp,
       speedMps: pos.speed >= 0 ? pos.speed : null,
       bearingDegrees: pos.heading >= 0 ? pos.heading : null,
@@ -571,10 +598,10 @@ class TrackingService with ChangeNotifier {
 
     final seq = _sequenceNumber++;
     final vertex = RouteVertex(
-      latitude: pos.latitude,
-      longitude: pos.longitude,
+      latitude: filtered.latitude,
+      longitude: filtered.longitude,
       timestamp: timestamp,
-      accuracyMeters: pos.accuracy,
+      accuracyMeters: safeFilteredAccuracy,
       speedMps: pos.speed >= 0 ? pos.speed : null,
       bearingDegrees: pos.heading >= 0 ? pos.heading : null,
       isGap: filterResult.isGap,
@@ -587,9 +614,9 @@ class TrackingService with ChangeNotifier {
         'session_uuid': _activeSessionUuid!,
         'client_point_id': clientPointId,
         'sequence_number': seq,
-        'latitude': pos.latitude,
-        'longitude': pos.longitude,
-        'accuracy_meters': pos.accuracy,
+        'latitude': filtered.latitude,
+        'longitude': filtered.longitude,
+        'accuracy_meters': safeFilteredAccuracy,
         'altitude_meters': pos.altitude != 0 ? pos.altitude : null,
         'speed_mps': pos.speed >= 0 ? pos.speed : null,
         'bearing_degrees': pos.heading >= 0 ? pos.heading : null,

@@ -69,6 +69,8 @@ class TrackingForegroundService : Service(), LocationListener {
     private var lastLng: Double? = null
     private var lastFixTimeMs: Long = 0L
 
+    private val kalmanFilter = AndroidKalmanLatLongFilter(qMetersPerSecond = 3.0)
+
     private var isPaused: Boolean = false
     private var db: SQLiteDatabase? = null
 
@@ -284,6 +286,7 @@ class TrackingForegroundService : Service(), LocationListener {
                     totalDistanceMeters = sessCursor.getDouble(0)
                 }
                 sessCursor.close()
+                kalmanFilter.reset(lastLat, lastLng, 10.0, System.currentTimeMillis())
                 Log.i(TAG, "State restored for $sUuid: seq=$sequenceNumber, dist=${totalDistanceMeters}m, lastPos=($lastLat, $lastLng)")
             }
         } catch (e: Exception) {
@@ -336,41 +339,58 @@ class TrackingForegroundService : Service(), LocationListener {
     override fun onLocationChanged(loc: Location) {
         if (isPaused || sessionUuid == null) return
 
-        val lat = loc.latitude
-        val lng = loc.longitude
-        val accuracy = loc.accuracy
+        val rawLat = loc.latitude
+        val rawLng = loc.longitude
+        val rawAccuracy = loc.accuracy
 
-        // Stage 1: Validate coordinate bounds and Null Island
-        if (lat < -90.0 || lat > 90.0 || lng < -180.0 || lng > 180.0) return
-        if (Math.abs(lat) < 1e-6 && Math.abs(lng) < 1e-6) return
+        // Stage 1: Boundary & Sentinel Check (NaN, Infinite, out-of-bounds, Null Island)
+        if (rawLat < -90.0 || rawLat > 90.0 || rawLng < -180.0 || rawLng > 180.0) return
+        if (Math.abs(rawLat) < 1e-6 && Math.abs(rawLng) < 1e-6) return
 
-        // Stage 2: Filter low accuracy (> 65 meters)
-        if (accuracy > 65.0f) {
-            Log.d(TAG, "Fix dropped due to poor accuracy: ${accuracy}m > 65m")
+        // Stage 2: Accuracy Threshold Gate (discard fixes > 65m)
+        if (rawAccuracy > 65.0f) {
+            Log.d(TAG, "Fix dropped due to poor accuracy: ${rawAccuracy}m > 65m")
             return
         }
 
         val nowMs = System.currentTimeMillis()
         val sUuid = sessionUuid!!
 
-        // Calculate displacement
-        var stepDist = 0.0
-        if (lastLat != null && lastLng != null) {
-            stepDist = haversineDistanceMeters(lastLat!!, lastLng!!, lat, lng)
-            val elapsedSec = (nowMs - lastFixTimeMs) / 1000.0
+        // 2D Kalman Filtering: balance previous state against incoming GPS measurement
+        val filtered = kalmanFilter.process(rawLat, rawLng, rawAccuracy.toDouble(), nowMs)
+        val lat = filtered.latitude
+        val lng = filtered.longitude
+        val accuracy = filtered.accuracy.toFloat()
 
-            // Speed sanity check (~198 km/h max = 55 m/s)
+        val elapsedSec = if (lastFixTimeMs > 0L) (nowMs - lastFixTimeMs) / 1000.0 else 0.0
+
+        // Stage 3: Discontinuous Gap Detection (> 15 minutes = 900s)
+        val isGap = elapsedSec > 900.0
+        if (isGap) {
+            lastLat = lat
+            lastLng = lng
+            lastFixTimeMs = nowMs
+        }
+
+        // Calculate step displacement
+        var stepDist = 0.0
+        if (!isGap && lastLat != null && lastLng != null) {
+            stepDist = haversineDistanceMeters(lastLat!!, lastLng!!, lat, lng)
+
+            // Stage 4: Teleportation & Glitch Detection (Implied speed > 55 m/s ≈ 198 km/h)
             if (elapsedSec > 0.5 && stepDist > 40.0) {
                 val speed = stepDist / elapsedSec
                 if (speed > 55.0) {
-                    Log.w(TAG, "Implied speed too high (${speed}m/s), dropping jump")
+                    Log.w(TAG, "Implied speed excessive (${speed}m/s > 55m/s), dropping jump")
                     return
                 }
             }
         }
 
-        // Commit distance if displacement >= 8.0 meters
-        if (stepDist >= 8.0) {
+        // Stage 5: Stationary Drift Suppression (Dead-Reckoning Threshold)
+        // Speeds < 0.4 m/s with displacement < 4.0m are filtered out to prevent stationary drift
+        val isStationary = loc.hasSpeed() && loc.speed < 0.4f && stepDist < 4.0
+        if (!isStationary && stepDist >= 8.0) {
             totalDistanceMeters += stepDist
             lastLat = lat
             lastLng = lng
@@ -591,5 +611,47 @@ class TrackingForegroundService : Service(), LocationListener {
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         sdf.timeZone = TimeZone.getTimeZone("UTC")
         return sdf.format(date)
+    }
+}
+
+/**
+ * 2D Kalman Filter for Android native location stream.
+ * Maintains full 64-bit double precision, with process noise Q = 3.0 m/s and dynamic R = accuracy^2.
+ */
+class AndroidKalmanLatLongFilter(private val qMetersPerSecond: Double = 3.0) {
+    private var lat: Double? = null
+    private var lng: Double? = null
+    private var variance: Double = -1.0
+    private var timestampMs: Long = 0L
+
+    fun reset(initialLat: Double? = null, initialLng: Double? = null, accuracy: Double? = null, tsMs: Long? = null) {
+        lat = initialLat
+        lng = initialLng
+        variance = if (accuracy != null && accuracy > 0) accuracy * accuracy else -1.0
+        timestampMs = tsMs ?: 0L
+    }
+
+    data class FilterResult(val latitude: Double, val longitude: Double, val accuracy: Double)
+
+    fun process(rawLat: Double, rawLng: Double, rawAccuracy: Double, tsMs: Long): FilterResult {
+        val safeAccuracy = if (rawAccuracy < 1.0) 1.0 else rawAccuracy
+        if (variance < 0 || lat == null || lng == null) {
+            lat = rawLat
+            lng = rawLng
+            variance = safeAccuracy * safeAccuracy
+            timestampMs = tsMs
+        } else {
+            val dtSeconds = Math.max(0.0, (tsMs - timestampMs) / 1000.0)
+            if (dtSeconds > 0) {
+                variance += dtSeconds * qMetersPerSecond * qMetersPerSecond
+                timestampMs = tsMs
+            }
+            val measurementVariance = safeAccuracy * safeAccuracy
+            val kalmanGain = variance / (variance + measurementVariance)
+            lat = lat!! + kalmanGain * (rawLat - lat!!)
+            lng = lng!! + kalmanGain * (rawLng - lng!!)
+            variance = (1.0 - kalmanGain) * variance
+        }
+        return FilterResult(lat!!, lng!!, Math.sqrt(variance))
     }
 }

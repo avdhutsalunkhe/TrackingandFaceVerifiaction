@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' as math;
 import 'gps_distance_calculator.dart';
 
@@ -208,4 +209,37 @@ class RouteSimplifier {
 
   static double _degToRad(double deg) => deg * (math.pi / 180.0);
   static double _radToDeg(double rad) => rad * (180.0 / math.pi);
+
+  /// Compact JSON serialization of route vertices
+  static String encodeVertices(List<RouteVertex> vertices) {
+    return jsonEncode(vertices.map((v) => v.toCompactList()).toList());
+  }
+
+  /// Deserialization of compact JSON route vertices
+  static List<RouteVertex> decodeVertices(String jsonStr) {
+    final List<dynamic> list = jsonDecode(jsonStr);
+    return list.map((item) => RouteVertex.fromCompactList(item as List<dynamic>)).toList();
+  }
+
+  /// Static convenience method for RDP simplification with optional epsilon tolerance
+  static List<RouteVertex> simplifyVertices(
+    List<RouteVertex> points, {
+    double epsilon = 3.5,
+    double minTurnAngleDegrees = 12.0,
+  }) {
+    final simplifier = RouteSimplifier(
+      epsilonMeters: epsilon,
+      minTurnAngleDegrees: minTurnAngleDegrees,
+    );
+    return simplifier.simplify(points);
+  }
+
+  /// Static convenience method for RDP simplification with optional epsilon tolerance
+  static List<RouteVertex> simplifyRoute(
+    List<RouteVertex> points, {
+    double epsilon = 3.5,
+    double minTurnAngleDegrees = 12.0,
+  }) {
+    return simplifyVertices(points, epsilon: epsilon, minTurnAngleDegrees: minTurnAngleDegrees);
+  }
 }

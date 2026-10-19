@@ -328,6 +328,8 @@ class TrackingDatabase {
 
   // --- Offline Route Points Operations ---
 
+  Future<int> queueOfflinePoint(Map<String, dynamic> row) => insertPoint(row);
+
   Future<int> insertPoint(Map<String, dynamic> row) async {
     if (_useMemoryFallback) {
       final point = Map<String, dynamic>.from(row);

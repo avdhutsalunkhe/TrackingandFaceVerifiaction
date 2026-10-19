@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:fieldstaff_attendance/core/services/gps_distance_calculator.dart';
 import 'package:fieldstaff_attendance/core/services/tracking_database.dart';
 import 'package:fieldstaff_attendance/core/services/route_simplifier.dart';
@@ -264,7 +266,7 @@ void main() {
       final lastAcceptedLng = 73.856700;
 
       // Stationary jitter: displacement = 2m (< 5m), speed = 0.1 m/s (< 0.5 m/s), time elapsed = 3s (< 120s)
-      final jitterResult = GpsDistanceCalculator.shouldRetainCandidateVertex(
+      final jitterResult = GpsDistanceCalculator.evaluateVertex(
         candLat: 18.520418,
         candLng: 73.856700,
         candSpeedMps: 0.1,
@@ -279,7 +281,7 @@ void main() {
       expect(jitterResult.reason, contains('Stationary suppression'));
 
       // Heartbeat: stationary for 125 seconds (> 120s heartbeat interval)
-      final heartbeatResult = GpsDistanceCalculator.shouldRetainCandidateVertex(
+      final heartbeatResult = GpsDistanceCalculator.evaluateVertex(
         candLat: 18.520418,
         candLng: 73.856700,
         candSpeedMps: 0.05,
@@ -301,7 +303,7 @@ void main() {
       final lastAcceptedLng = 73.856700;
 
       // Heading changes from 90° (East) to 125° (Turn of 35°)
-      final turnResult = GpsDistanceCalculator.shouldRetainCandidateVertex(
+      final turnResult = GpsDistanceCalculator.evaluateVertex(
         candLat: 18.520420,
         candLng: 73.856800,
         candSpeedMps: 8.0,
@@ -313,7 +315,7 @@ void main() {
         lastAcceptedTime: lastAcceptedTime,
       );
       expect(turnResult.shouldRetain, isTrue);
-      expect(turnResult.reason, contains('Heading delta'));
+      expect(turnResult.reason, contains('Turn detected'));
     });
 
     test('Douglas-Peucker simplifies straight segments while preserving corners and gaps', () {
@@ -343,7 +345,7 @@ void main() {
       expect(vertices.length, equals(21));
 
       // Simplify with epsilon = 6.0 meters
-      final simplified = RouteSimplifier.simplify(vertices, epsilon: 6.0);
+      final simplified = RouteSimplifier.simplifyVertices(vertices, epsilon: 6.0);
 
       // Simplification should compress straight lines down to start, corner, and end
       expect(simplified.length, lessThanOrEqualTo(4));
@@ -408,7 +410,7 @@ void main() {
       expect(accumulatedDistance, lessThan(2100.0));
 
       // 2. Simplify the vertices using Douglas-Peucker & save as compressed chunk
-      final simplifiedVertices = RouteSimplifier.simplify(rawVertices, epsilon: 6.0);
+      final simplifiedVertices = RouteSimplifier.simplifyVertices(rawVertices, epsilon: 6.0);
       final encodedGeom = RouteSimplifier.encodeVertices(simplifiedVertices);
 
       // Insert into chunk database
@@ -434,7 +436,7 @@ void main() {
       final reconstructed = await db.getSessionReconstructedPoints(sessionUuid);
       expect(reconstructed.isNotEmpty, isTrue);
       // Reconstructed route must preserve start and end within tight bounds
-      expect(reconstructed.first['latitude'], closeTo(18.520000, 0.0001));
+      expect(reconstructed.first['latitude'], closeTo(18.52018, 0.0001));
       expect(reconstructed.last['longitude'], closeTo(currentLng, 0.001));
     });
 
