@@ -22,6 +22,7 @@ class TokenResponse(BaseModel):
     # Device Registration Status
     device_id: Optional[str] = None
     is_device_registered: bool = False
+    client_type: Optional[str] = "WEB"
 
 class LoginRequest(BaseModel):
     employee_id: str = Field(..., min_length=1, max_length=64, description="Employee ID or Admin ID")

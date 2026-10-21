@@ -71,13 +71,27 @@ def test_setup():
         user_id = user.id
         shift_id = shift.id
 
-        return {
+        yield {
             "headers": headers,
             "user_id": user_id,
             "shift_id": shift_id,
         }
     finally:
-        db.close()
+        try:
+            sessions = db.query(TrackingSession).filter(TrackingSession.user_id == user_id).all()
+            s_ids = [s.id for s in sessions]
+            if s_ids:
+                db.query(GpsRoutePoint).filter(GpsRoutePoint.session_id.in_(s_ids)).delete(synchronize_session=False)
+                db.query(TrackingRouteChunk).filter(TrackingRouteChunk.session_id.in_(s_ids)).delete(synchronize_session=False)
+                db.query(TrackingInterruptionEvent).filter(TrackingInterruptionEvent.session_id.in_(s_ids)).delete(synchronize_session=False)
+                db.query(TrackingSession).filter(TrackingSession.id.in_(s_ids)).delete(synchronize_session=False)
+            db.query(EmployeeShiftAssignment).filter(EmployeeShiftAssignment.user_id == user_id).delete(synchronize_session=False)
+            db.query(User).filter(User.id == user_id).delete(synchronize_session=False)
+            db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
 
 
 def test_scenario_1_and_2_shift_begins_single_session_guarantee(test_setup):

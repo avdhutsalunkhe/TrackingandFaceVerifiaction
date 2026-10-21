@@ -43,6 +43,9 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    # Store client_type on request.state for downstream permission checks
+    request.state.client_type = (payload.get("client_type") or request.headers.get("x-client-type") or "WEB").upper()
+    
     user = db.query(User).filter(User.id == int(user_id)).first()
     if not user:
         raise HTTPException(
@@ -59,15 +62,66 @@ def get_current_user(
     
     return user
 
+import re
+
 def require_admin(
+    request: Request,
     current_user: User = Depends(get_current_user)
 ) -> User:
-    """Dependency to restrict route to ADMIN role."""
+    """Dependency to restrict route to ADMIN role.
+    When Admin logs in from the mobile application (client_type == 'MOBILE'),
+    access is strictly limited to Employee Face Registration endpoints.
+    All other administrative operations require the Web / PC portal.
+    """
     if current_user.role != UserRole.ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required",
         )
+    
+    # Check mobile admin restriction
+    client_type = getattr(request.state, "client_type", None)
+    if not client_type:
+        auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+        if auth_header:
+            try:
+                payload = decode_access_token(auth_header)
+                client_type = payload.get("client_type")
+            except Exception:
+                pass
+    if not client_type:
+        client_type = request.headers.get("x-client-type")
+
+    if client_type and str(client_type).strip().upper() == "MOBILE":
+        path = request.url.path
+        method = request.method.upper()
+        # Allowed exclusively for Mobile Admin:
+        # GET /api/admin/users
+        # GET /api/admin/users/{id}
+        # POST /api/admin/users/{id}/face
+        # GET /api/admin/users/{id}/face/samples
+        # DELETE /api/admin/users/{id}/face
+        is_allowed = False
+        if method == "GET" and re.match(r"^/api/admin/users/?$", path):
+            is_allowed = True
+        elif method == "GET" and re.match(r"^/api/admin/users/\d+/?$", path):
+            is_allowed = True
+        elif method in ("GET", "POST", "DELETE") and re.match(r"^/api/admin/users/\d+/face.*", path):
+            is_allowed = True
+
+        if not is_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Mobile admin session is restricted exclusively to employee face registration. Please use the Web / PC portal for full system administration.",
+            )
+
+    return current_user
+
+def require_web_admin(
+    request: Request,
+    current_user: User = Depends(require_admin)
+) -> User:
+    """Explicit dependency ensuring caller is an admin on Web/PC."""
     return current_user
 
 def require_time_office(

@@ -3,7 +3,7 @@ import '../../core/theme/app_theme.dart';
 import '../../core/services/auth_service.dart';
 import '../../core/utils/responsive_util.dart';
 import '../user/user_dashboard_screen.dart';
-import '../admin/admin_dashboard_screen.dart';
+import '../admin/admin_face_registration_screen.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
   final String? currentPassword;
@@ -76,7 +76,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
         if (!mounted) return;
         if (role == 'ADMIN') {
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const AdminDashboardScreen()),
+            MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
           );
         } else {
           Navigator.of(context).pushReplacement(

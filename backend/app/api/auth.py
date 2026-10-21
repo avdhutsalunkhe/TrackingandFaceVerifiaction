@@ -43,13 +43,19 @@ def login(login_data: LoginRequest, request: Request, db: Session = Depends(get_
         else:
             client_type = "WEB"
 
-    # Enforce role-based platform restrictions
-    if user.role in (UserRole.ADMIN, UserRole.TIME_OFFICE):
+    # Enforce role-based platform restrictions:
+    # - TIME_OFFICE: Restricted strictly to Web / PC portal.
+    # - ADMIN: Permitted on Web / PC (full administration) AND on Mobile (dedicated employee face registration).
+    # - USER: Restricted strictly to the mobile phone application.
+    if user.role == UserRole.TIME_OFFICE:
         if client_type == "MOBILE":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin login is restricted to the Web portal. Please log in using the Time Office web or PC application.",
+                detail="Time Office login is restricted to the Web portal. Please log in using the Time Office web or PC application.",
             )
+    elif user.role == UserRole.ADMIN:
+        # Admin is allowed to log in via Mobile specifically for employee face registration
+        pass
     elif user.role == UserRole.USER:
         if client_type == "WEB":
             raise HTTPException(
@@ -119,7 +125,7 @@ def login(login_data: LoginRequest, request: Request, db: Session = Depends(get_
         ip_address=request.client.host if request.client else None
     )
 
-    token_info = create_user_token(user)
+    token_info = create_user_token(user, client_type=client_type)
     return TokenResponse(**token_info)
 
 @router.post("/change-password")

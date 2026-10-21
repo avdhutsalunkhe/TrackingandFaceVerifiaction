@@ -16,13 +16,15 @@ def authenticate_user(db: Session, employee_id: str, password: str) -> Optional[
         return None
     return user
 
-def create_user_token(user: User) -> dict:
+def create_user_token(user: User, client_type: Optional[str] = "WEB") -> dict:
     """Generate JWT access token and session metadata."""
+    eff_client_type = (client_type or "WEB").upper()
     payload = {
         "sub": str(user.id),
         "user_id": user.id,
         "employee_id": user.employee_id,
-        "role": user.role.value
+        "role": user.role.value,
+        "client_type": eff_client_type
     }
     expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(data=payload, expires_delta=expires_delta)
@@ -36,6 +38,7 @@ def create_user_token(user: User) -> dict:
         "role": user.role.value,
         "employee_id": user.employee_id,
         "full_name": user.full_name,
+        "client_type": eff_client_type,
         "must_change_password": user.must_change_password,
         "face_enabled": getattr(user, "face_enabled", True),
         "geofence_enabled": getattr(user, "geofence_enabled", True),

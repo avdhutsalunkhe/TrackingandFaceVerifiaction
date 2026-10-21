@@ -19,7 +19,22 @@ def auth_headers():
     user_id = user.id if user else 1
     db.close()
     token = create_access_token(data={"sub": str(user_id)})
-    return {"Authorization": f"Bearer {token}"}
+    yield {"Authorization": f"Bearer {token}"}
+
+    # Teardown: Clean up test tracking artifacts created during tests
+    db = SessionLocal()
+    try:
+        sessions = db.query(TrackingSession).filter(TrackingSession.session_uuid.like("TEST_%")).all()
+        s_ids = [s.id for s in sessions]
+        if s_ids:
+            db.query(GpsRoutePoint).filter(GpsRoutePoint.session_id.in_(s_ids)).delete(synchronize_session=False)
+            db.query(TrackingRouteChunk).filter(TrackingRouteChunk.session_id.in_(s_ids)).delete(synchronize_session=False)
+            db.query(TrackingSession).filter(TrackingSession.id.in_(s_ids)).delete(synchronize_session=False)
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def test_offline_points_auto_recovery_and_deduplication(auth_headers):

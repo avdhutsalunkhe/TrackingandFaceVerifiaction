@@ -38,7 +38,7 @@ from app.schemas.attendance_request import (
     AttendanceRequestResponse,
     AttendanceRequestReview,
 )
-from app.dependencies import require_admin
+from app.dependencies import require_admin, require_web_admin
 from app.config import settings
 from app.security.hashing import get_password_hash
 from app.services.audit_service import log_audit_event
@@ -53,7 +53,7 @@ from app.ml.similarity import aggregate_embeddings, compute_cosine_similarity
 router = APIRouter(prefix="/api/admin", tags=["Admin Management"], dependencies=[Depends(require_admin)])
 
 @router.get("/dashboard-stats", response_model=DashboardStatsResponse)
-def get_dashboard_stats(db: Session = Depends(get_db)):
+def get_dashboard_stats(db: Session = Depends(get_db), admin: User = Depends(require_web_admin)):
     """Retrieve overview metrics for Admin Dashboard."""
     total_employees = db.query(User).filter(User.role == UserRole.USER).count()
     active_employees = db.query(User).filter(User.role == UserRole.USER, User.is_active == True).count()
@@ -81,7 +81,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     )
 
 @router.post("/users", response_model=UserResponse)
-def create_employee(user_in: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+def create_employee(user_in: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_web_admin)):
     """Create a new employee with initial password and mandatory password change."""
     existing = db.query(User).filter(User.employee_id == user_in.employee_id).first()
     if existing:

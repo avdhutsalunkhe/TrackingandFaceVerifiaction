@@ -9,6 +9,9 @@ class UserModel {
   final Map<String, dynamic>? geofence;
   final Map<String, dynamic>? attendanceWindow;
 
+  final String? department;
+  final String? designation;
+
   final bool faceEnabled;
   final bool geofenceEnabled;
   final bool shiftEnabled;
@@ -29,6 +32,8 @@ class UserModel {
     required this.hasFaceEnrolled,
     this.geofence,
     this.attendanceWindow,
+    this.department,
+    this.designation,
     this.faceEnabled = true,
     this.geofenceEnabled = true,
     this.shiftEnabled = true,
@@ -51,6 +56,8 @@ class UserModel {
       hasFaceEnrolled: json['has_face_enrolled'] ?? false,
       geofence: json['geofence'] != null ? Map<String, dynamic>.from(json['geofence']) : null,
       attendanceWindow: json['attendance_window'] != null ? Map<String, dynamic>.from(json['attendance_window']) : null,
+      department: json['department'],
+      designation: json['designation'],
       faceEnabled: json['face_enabled'] ?? true,
       geofenceEnabled: json['geofence_enabled'] ?? true,
       shiftEnabled: json['shift_enabled'] ?? true,

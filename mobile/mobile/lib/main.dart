@@ -10,7 +10,7 @@ import 'core/localization/app_translations.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/auth/change_password_screen.dart';
 import 'screens/user/user_dashboard_screen.dart';
-import 'screens/admin/admin_dashboard_screen.dart';
+import 'screens/admin/admin_face_registration_screen.dart';
 
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -111,7 +111,7 @@ class _SplashScreenState extends State<SplashScreen> {
       );
     } else if (role == 'ADMIN') {
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const AdminDashboardScreen()),
+        MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
       );
     } else {
       final userId = profile['id'] ?? profile['user_id'] ?? 0;
