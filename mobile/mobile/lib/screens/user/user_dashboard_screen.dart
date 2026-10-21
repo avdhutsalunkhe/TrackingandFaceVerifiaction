@@ -479,6 +479,161 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
   }
 
 
+  void _openTravelMap() {
+    final userId = _config?['user_id'] ?? 0;
+    final empCode = _config?['employee_id']?.toString();
+    final empName = _config?['employee_name']?.toString() ?? _config?['name']?.toString();
+    final tracking = TrackingService.instance;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => EmployeeTravelMapScreen(
+          initialEmployeeId: userId is int ? userId : int.tryParse(userId.toString()) ?? 0,
+          initialEmployeeCode: empCode,
+          initialEmployeeName: empName,
+          initialSessionUuid: tracking.activeSessionUuid,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTravelMapCard() {
+    return ListenableBuilder(
+      listenable: TrackingService.instance,
+      builder: (context, _) {
+        final tracking = TrackingService.instance;
+        final isTracking = tracking.isTracking;
+        final isPaused = tracking.isPaused;
+
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFFE2E8F0)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.04),
+                blurRadius: 10,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF2563EB), Color(0xFF1D4ED8)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF2563EB).withOpacity(0.25),
+                          blurRadius: 6,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: const Icon(Icons.satellite_alt_rounded, color: Colors.white, size: 22),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Travel Route & Satellite Map',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          isTracking
+                              ? (isPaused ? 'Tracking Paused' : 'Live Tracking Active')
+                              : 'View Duty Route & Timeline',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isTracking
+                                ? (isPaused ? const Color(0xFFD97706) : const Color(0xFF16A34A))
+                                : AppColors.textSecondary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (isTracking)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isPaused ? const Color(0xFFFEF3C7) : const Color(0xFFDCFCE7),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              color: isPaused ? const Color(0xFFD97706) : const Color(0xFF16A34A),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            isPaused ? 'PAUSED' : 'LIVE',
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w800,
+                              color: isPaused ? const Color(0xFFB45309) : const Color(0xFF15803D),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'View your field travel route, GPS points, distance covered, and high-resolution Esri satellite imagery.',
+                style: TextStyle(fontSize: 12, color: Color(0xFF64748B), height: 1.35),
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _openTravelMap,
+                  icon: const Icon(Icons.map_rounded, size: 18),
+                  label: const Text(
+                    '🛰️ Open Satellite Route Map',
+                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E40AF),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    elevation: 0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   // Employee-facing tracking UI removed per notification-only background tracking requirement
   Widget _buildTrackingStatusBanner() => const SizedBox.shrink();
 
@@ -897,6 +1052,11 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
               );
             },
           ),
+          IconButton(
+            icon: const Icon(Icons.satellite_alt_rounded, color: Color(0xFF1E40AF)),
+            tooltip: 'Satellite Travel Map',
+            onPressed: _openTravelMap,
+          ),
           const LanguageSelectorAction(),
           IconButton(
             icon: const Icon(Icons.history_rounded, color: AppColors.textPrimary),
@@ -942,6 +1102,10 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
 
                       // 4. Assigned Work Location Card (No coordinates or meters)
                       _buildCleanLocationCard(),
+                      const SizedBox(height: 16),
+
+                      // 4b. Travel Route & Satellite Map Card
+                      _buildTravelMapCard(),
                       const SizedBox(height: 20),
 
                       // 5. Main Attendance Action Button
