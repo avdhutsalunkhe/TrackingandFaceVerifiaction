@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.database.sqlite.SQLiteDatabase
 import android.location.Location
@@ -21,6 +22,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -100,6 +102,9 @@ class TrackingForegroundService : Service(), LocationListener {
                 return START_STICKY
             }
             ACTION_START -> {
+                // Must call startForeground immediately to fulfill Android foreground service contract
+                startForegroundWithNotification("Tracking started. Acquiring GPS fixes...")
+
                 // Read extras or fallback to FlutterSharedPreferences
                 val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
                 sessionUuid = intent?.getStringExtra(EXTRA_SESSION_UUID)
@@ -119,9 +124,6 @@ class TrackingForegroundService : Service(), LocationListener {
                 // Restore last known coordinates and sequence number from SQLite
                 restoreStateFromDb()
 
-                // Start Foreground with proper Android 14 location type
-                startForegroundWithNotification("Tracking started. Acquiring GPS fixes...")
-
                 // Request location updates
                 startLocationUpdates()
                 isServiceRunning = true
@@ -130,6 +132,12 @@ class TrackingForegroundService : Service(), LocationListener {
 
         // Return START_STICKY to allow Android process recreation after memory pressure
         return START_STICKY
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
     }
 
     private fun createNotificationChannel() {
@@ -162,6 +170,8 @@ class TrackingForegroundService : Service(), LocationListener {
 
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        } ?: Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -178,18 +188,21 @@ class TrackingForegroundService : Service(), LocationListener {
         }
 
         val accuracyStr = if (accuracyMeters != null) " (±${accuracyMeters.toInt()}m)" else ""
-        val bigText = """
-            $statusLine
-            Schedule: $scheduleDisplay
-            Last GPS update: $lastFixStr$accuracyStr
-            Total Travel: %.2f km
-        """.trimIndent().format(distKm)
+        val formattedDist = String.format(Locale.US, "%.2f", distKm)
+        val bigText = "$statusLine\nSchedule: $scheduleDisplay\nLast GPS update: $lastFixStr$accuracyStr\nTotal Travel: $formattedDist km"
+
+        val iconRes = try {
+            val resId = resources.getIdentifier("ic_stat_fieldtrack", "drawable", packageName)
+            if (resId != 0) resId else applicationInfo.icon
+        } catch (_: Exception) {
+            applicationInfo.icon
+        }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("FieldTrack")
             .setContentText("$statusLine • Schedule: $scheduleDisplay")
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
-            .setSmallIcon(R.drawable.ic_stat_fieldtrack)
+            .setSmallIcon(iconRes)
             .setOngoing(status == "Active" || status == "Interrupted")
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -199,18 +212,39 @@ class TrackingForegroundService : Service(), LocationListener {
     }
 
     private fun startForegroundWithNotification(contentText: String) {
-        val notification = buildNotification(status = "Active", detailText = contentText)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            val notification = buildNotification(status = "Active", detailText = contentText)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                if (hasLocationPermission()) {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    // Android 14: Use dataSync foreground type when location permission is pending
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startForegroundWithNotification primary failed: $e")
+            try {
+                val notification = buildNotification(status = "Active", detailText = contentText)
+                startForeground(NOTIFICATION_ID, notification)
+            } catch (e2: Exception) {
+                Log.e(TAG, "startForegroundWithNotification fatal fallback failed: $e2")
+            }
         }
     }
 
     private fun updateNotification(status: String = "Active", detailText: String? = null, accuracyMeters: Float? = null) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val notification = buildNotification(status, detailText, accuracyMeters)
-        manager.notify(NOTIFICATION_ID, notification)
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val notification = buildNotification(status, detailText, accuracyMeters)
+            manager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not update notification: $e")
+        }
     }
 
     private fun acquireWakeLock() {
@@ -295,6 +329,11 @@ class TrackingForegroundService : Service(), LocationListener {
     }
 
     private fun startLocationUpdates() {
+        if (!hasLocationPermission()) {
+            Log.w(TAG, "Location permission not yet granted by user; deferring updates")
+            broadcastHealthEvent("PERMISSION_DENIED", "Location permission pending user grant")
+            return
+        }
         try {
             locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
 

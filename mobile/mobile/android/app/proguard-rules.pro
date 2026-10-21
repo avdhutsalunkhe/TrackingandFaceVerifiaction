@@ -17,3 +17,11 @@
 -dontwarn io.flutter.embedding.**
 -dontwarn javax.annotation.**
 -dontwarn org.checkerframework.**
+
+# Native Tracking Services & Receivers
+-keep class com.fieldstaff.attendance.fieldstaff_attendance.** { *; }
+-keepclassmembers class com.fieldstaff.attendance.fieldstaff_attendance.** { *; }
+-keep class * extends android.app.Service { *; }
+-keep class * extends android.content.BroadcastReceiver { *; }
+-keep class **.R$* { *; }
+-keep class **.R { *; }

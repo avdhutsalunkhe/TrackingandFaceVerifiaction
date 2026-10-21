@@ -28,6 +28,13 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
+                    val fine = ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    val coarse = ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    if (!fine && !coarse) {
+                        result.error("PERMISSION_DENIED", "Location permissions are not yet granted by user", null)
+                        return@setMethodCallHandler
+                    }
+
                     val sessionUuid = call.argument<String>("session_uuid")
                     val userId = call.argument<Int>("user_id") ?: 0
                     val attendanceId = call.argument<Int>("attendance_id") ?: 0
@@ -104,14 +111,18 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "requestBatteryOptimizationExemption" -> {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                data = Uri.parse("package:$packageName")
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                    data = Uri.parse("package:$packageName")
+                                }
+                                startActivity(intent)
                             }
-                            startActivity(intent)
                         }
+                    } catch (e: Exception) {
+                        android.util.Log.w("MainActivity", "Failed to show battery optimization dialog: $e")
                     }
                     result.success(true)
                 }

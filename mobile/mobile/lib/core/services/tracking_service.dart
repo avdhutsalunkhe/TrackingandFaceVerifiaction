@@ -133,11 +133,14 @@ class TrackingService with ChangeNotifier {
     await prefs.setString('tracking_schedule_end', endTime);
     await prefs.setString('tracking_timezone', timezone);
 
-    // Request permissions and battery optimizations transparently in background
-    await _verifyLocationPrerequisites();
-    await NativeBackgroundTracking.requestBatteryOptimizationExemption();
+    // 1. Check location prerequisites first
+    final hasPermission = await _verifyLocationPrerequisites();
+    if (!hasPermission) {
+      debugPrint('[TrackingService] Location permission pending user confirmation. Deferring background service start.');
+      return;
+    }
 
-    // Configure native Android scheduler (evaluates schedule & starts service if in window)
+    // 2. Configure native Android scheduler (evaluates schedule & starts service if in window)
     await NativeBackgroundTracking.scheduleTracking(
       userId: userId,
       is24x7: is24x7,
@@ -145,6 +148,9 @@ class TrackingService with ChangeNotifier {
       endTime: endTime,
       timezone: timezone,
     );
+
+    // 3. Request battery optimizations transparently
+    await NativeBackgroundTracking.requestBatteryOptimizationExemption();
 
     // Start background sync timer for offline SQLite points
     _listenToNativeEvents();
@@ -635,6 +641,7 @@ class TrackingService with ChangeNotifier {
         foregroundNotificationConfig: const ForegroundNotificationConfig(
           notificationTitle: 'FieldStaff Journey Tracking Active',
           notificationText: 'Tracking attendance route in background...',
+          notificationIcon: AndroidResource(name: 'ic_stat_fieldtrack'),
           enableWakeLock: true,
           setOngoing: true,
         ),

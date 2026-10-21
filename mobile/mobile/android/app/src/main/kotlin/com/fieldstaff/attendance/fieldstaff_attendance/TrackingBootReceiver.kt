@@ -17,23 +17,27 @@ class TrackingBootReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action
-        Log.i(TAG, "onReceive action: $action")
+        try {
+            val action = intent.action
+            Log.i(TAG, "onReceive action: $action")
 
-        when (action) {
-            Intent.ACTION_BOOT_COMPLETED,
-            "android.intent.action.QUICKBOOT_POWERON",
-            "com.htc.intent.action.QUICKBOOT_POWERON",
-            Intent.ACTION_MY_PACKAGE_REPLACED,
-            TrackingScheduler.ACTION_START_SCHEDULED,
-            TrackingScheduler.ACTION_STOP_SCHEDULED,
-            TrackingScheduler.ACTION_WATCHDOG -> {
-                Log.i(TAG, "Evaluating and reconciling tracking schedule for action: $action")
-                TrackingScheduler.evaluateAndSchedule(context)
+            when (action) {
+                Intent.ACTION_BOOT_COMPLETED,
+                "android.intent.action.QUICKBOOT_POWERON",
+                "com.htc.intent.action.QUICKBOOT_POWERON",
+                Intent.ACTION_MY_PACKAGE_REPLACED,
+                TrackingScheduler.ACTION_START_SCHEDULED,
+                TrackingScheduler.ACTION_STOP_SCHEDULED,
+                TrackingScheduler.ACTION_WATCHDOG -> {
+                    Log.i(TAG, "Evaluating and reconciling tracking schedule for action: $action")
+                    TrackingScheduler.evaluateAndSchedule(context)
+                }
+                else -> {
+                    Log.i(TAG, "Unhandled action: $action")
+                }
             }
-            else -> {
-                Log.i(TAG, "Unhandled action: $action")
-            }
+        } catch (e: Exception) {
+            Log.e(TAG, "TrackingBootReceiver onReceive error: $e")
         }
     }
 }
