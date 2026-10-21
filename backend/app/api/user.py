@@ -261,7 +261,9 @@ async def verify_attendance(
     if not frames_bytes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No camera frames provided")
 
-    decision = AttendanceDecisionService.evaluate_attendance(
+    from starlette.concurrency import run_in_threadpool
+    decision = await run_in_threadpool(
+        AttendanceDecisionService.evaluate_attendance,
         db=db,
         user=current_user,
         current_lat=current_latitude,

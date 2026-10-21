@@ -4,6 +4,8 @@ import numpy as np
 from typing import Optional
 import onnxruntime as ort
 
+from app.config import settings
+
 class ArcFaceRecognizer:
     """
     ArcFace / IResNet50 deep-learning face recognition feature extractor.
@@ -21,8 +23,11 @@ class ArcFaceRecognizer:
     def _init_model(self):
         if self.model_path and os.path.exists(self.model_path):
             try:
+                num_threads = getattr(settings, 'ONNX_NUM_THREADS', 4)
+                inter_threads = getattr(settings, 'ONNX_INTER_OP_THREADS', 1)
                 opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 2
+                opts.intra_op_num_threads = num_threads
+                opts.inter_op_num_threads = inter_threads
                 opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self.session = ort.InferenceSession(self.model_path, opts, providers=['CPUExecutionProvider'])
                 self.input_name = self.session.get_inputs()[0].name

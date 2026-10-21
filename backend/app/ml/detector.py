@@ -4,6 +4,8 @@ import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 import onnxruntime as ort
 
+from app.config import settings
+
 class FaceDetectionResult:
     def __init__(self, bbox: np.ndarray, landmarks: np.ndarray, score: float):
         self.bbox = bbox # [x1, y1, x2, y2]
@@ -30,13 +32,28 @@ class SCRFDDetector:
         self.session = None
         self.input_name = None
         self.input_shape = (640, 640)
+        
+        # Precompute static anchor grids for fixed input shape (640x640) across strides 8, 16, 32
+        # Eliminates repeated np.meshgrid allocations during every single frame detection
+        self.anchor_grids: Dict[int, np.ndarray] = {}
+        target_w, target_h = self.input_shape
+        for stride in [8, 16, 32]:
+            grid_h = target_h // stride
+            grid_w = target_w // stride
+            grid_y, grid_x = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
+            grid = np.stack([grid_x.flatten(), grid_y.flatten()], axis=-1).astype(np.float32) * stride
+            self.anchor_grids[stride] = grid
+
         self._init_model()
 
     def _init_model(self):
         if self.model_path and os.path.exists(self.model_path):
             try:
+                num_threads = getattr(settings, 'ONNX_NUM_THREADS', 4)
+                inter_threads = getattr(settings, 'ONNX_INTER_OP_THREADS', 1)
                 opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 2
+                opts.intra_op_num_threads = num_threads
+                opts.inter_op_num_threads = inter_threads
                 opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self.session = ort.InferenceSession(self.model_path, opts, providers=['CPUExecutionProvider'])
                 self.input_name = self.session.get_inputs()[0].name
@@ -97,13 +114,17 @@ class SCRFDDetector:
             if len(pos_inds) == 0:
                 continue
 
-            grid_h = target_h // stride
-            grid_w = target_w // stride
-            total_points = grid_h * grid_w
+            total_points = (target_h // stride) * (target_w // stride)
             num_anchors = score.shape[0] // total_points
 
-            grid_y, grid_x = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
-            grid = np.stack([grid_x.flatten(), grid_y.flatten()], axis=-1) * stride
+            grid = self.anchor_grids.get(stride)
+            if grid is None or grid.shape[0] != total_points:
+                grid_h = target_h // stride
+                grid_w = target_w // stride
+                grid_y, grid_x = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
+                grid = np.stack([grid_x.flatten(), grid_y.flatten()], axis=-1).astype(np.float32) * stride
+                self.anchor_grids[stride] = grid
+
             if num_anchors > 1:
                 grid = np.repeat(grid, num_anchors, axis=0)
             

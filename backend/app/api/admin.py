@@ -579,6 +579,8 @@ async def enroll_face_sample(
             db.query(FaceEnrollmentSample).filter(FaceEnrollmentSample.user_id == u.id).delete()
             db.query(FaceTemplate).filter(FaceTemplate.user_id == u.id).delete()
             db.commit()
+            from app.services.face_cache_service import FaceCacheService
+            FaceCacheService.invalidate(u.id)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Face registration validation failed (inconsistent samples). Please register the face again."
@@ -605,6 +607,8 @@ async def enroll_face_sample(
             db.add(template)
         
         db.commit()
+        from app.services.face_cache_service import FaceCacheService
+        FaceCacheService.invalidate(u.id)
 
         log_audit_event(
             db=db,

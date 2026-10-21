@@ -41,11 +41,20 @@ class TrackingSession(Base):
     total_duration_seconds = Column(Integer, nullable=False, default=0)
     retained_point_count = Column(Integer, nullable=False, default=0)
 
-    # Minimal recovery & health state
+    # Shift boundaries & actual execution times
+    shift_start_time = Column(DateTime, nullable=True)
+    shift_end_time = Column(DateTime, nullable=True)
+    actual_start_time = Column(DateTime, nullable=True)
+    actual_stop_time = Column(DateTime, nullable=True)
+    device_id = Column(String(128), nullable=True)
+
+    # Tracking health, heartbeat, and completeness
     last_accepted_latitude = Column(Numeric(11, 8), nullable=True)
     last_accepted_longitude = Column(Numeric(11, 8), nullable=True)
     last_accepted_time = Column(DateTime, nullable=True)
+    last_heartbeat_time = Column(DateTime, nullable=True)
     last_sync_time = Column(DateTime, nullable=True)
+    tracking_completeness = Column(String(32), nullable=False, default="COMPLETE") # COMPLETE, HAS_GAPS, PENDING_SYNC, INCOMPLETE
     
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -64,6 +73,56 @@ class TrackingSession(Base):
         back_populates="session",
         cascade="all, delete-orphan",
         order_by="TrackingRouteChunk.chunk_sequence.asc()",
+    )
+    interruption_events = relationship(
+        "TrackingInterruptionEvent",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="TrackingInterruptionEvent.detected_at.asc()",
+    )
+
+
+class TrackingInterruptionEvent(Base):
+    """Represents an interruption or degradation event within a tracking session.
+    Allows exact diagnosis (e.g. GPS disabled vs poor accuracy vs internet outage)."""
+    __tablename__ = "tracking_interruption_events"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    event_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    session_id = Column(Integer, ForeignKey("tracking_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_uuid = Column(String(64), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    device_id = Column(String(128), nullable=True)
+
+    # Reason codes: LOCATION_SERVICES_DISABLED, GPS_FIX_UNAVAILABLE, GNSS_ACQUISITION_FAILURE,
+    # LOCATION_UNAVAILABLE, POOR_ACCURACY, LOCATION_PERMISSION_REVOKED,
+    # BACKGROUND_LOCATION_PERMISSION_MISSING, INTERNET_DISCONNECTED,
+    # BACKGROUND_SERVICE_STOPPED, TRACKING_HEARTBEAT_LOST, SERVICE_INTERRUPTED, SHIFT_ENDED_NORMALLY
+    reason_code = Column(String(64), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    severity = Column(String(32), nullable=False, default="WARNING")  # INFO, WARNING, CRITICAL
+
+    detected_at = Column(DateTime, nullable=False, index=True)
+    recovered_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+
+    last_known_latitude = Column(Numeric(11, 8), nullable=True)
+    last_known_longitude = Column(Numeric(11, 8), nullable=True)
+    last_known_location_time = Column(DateTime, nullable=True)
+
+    diagnostic_details = Column(Text, nullable=True)  # JSON formatted metadata
+    is_confirmed = Column(Integer, default=1, nullable=False)  # 1 = confirmed by OS/API, 0 = inferred by timeout
+    recovery_outcome = Column(String(64), default="UNRESOLVED", nullable=False)  # RECOVERED, UNRESOLVED, SHIFT_CONCLUDED
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    session = relationship("TrackingSession", back_populates="interruption_events")
+    user = relationship("User")
+
+    __table_args__ = (
+        Index("idx_interruption_session_detected", "session_id", "detected_at"),
+        Index("idx_interruption_user_detected", "user_id", "detected_at"),
     )
 
 

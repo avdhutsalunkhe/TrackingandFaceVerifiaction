@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     # GPS
     MAX_GPS_ACCURACY_THRESHOLD_METERS: float = 50.0
 
+    # ONNX Inference Optimization & Threading
+    ONNX_NUM_THREADS: int = 4
+    ONNX_INTER_OP_THREADS: int = 1
+    MODEL_WARMUP_ON_STARTUP: bool = True
+    TEMPLATE_CACHE_ENABLED: bool = True
+    TEMPLATE_CACHE_TTL_SECONDS: int = 3600
+
     # CORS
     CORS_ORIGINS: str = "*"
 

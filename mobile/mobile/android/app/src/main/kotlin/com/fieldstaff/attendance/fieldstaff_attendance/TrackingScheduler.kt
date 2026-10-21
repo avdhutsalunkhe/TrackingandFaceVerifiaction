@@ -115,17 +115,17 @@ object TrackingScheduler {
 
         var activeUuid = prefs.getString("flutter.active_tracking_session_uuid", null)
         val activeDate = prefs.getString("flutter.active_tracking_date", null)
+        val shiftId = prefs.getLong("flutter.shift_id", 0L).toInt()
 
         if (activeUuid == null || activeDate != todayStr) {
-            val punchId = System.currentTimeMillis()
-            activeUuid = "TRACK_${userId}_${todayStr}_AUTO_${punchId}"
+            val shiftPart = if (shiftId > 0) "SHIFT_${shiftId}" else "GENERAL"
+            activeUuid = "TRACK_${userId}_${shiftPart}_${todayStr}"
             prefs.edit()
                 .putString("flutter.active_tracking_session_uuid", activeUuid)
                 .putLong("flutter.active_tracking_user_id", userId.toLong())
-                .putLong("flutter.active_tracking_attendance_id", punchId)
                 .putString("flutter.active_tracking_date", todayStr)
                 .apply()
-            Log.i(TAG, "Created daily tracking session: $activeUuid")
+            Log.i(TAG, "Resolved canonical single shift tracking session: $activeUuid")
         }
 
         val serviceIntent = Intent(context, TrackingForegroundService::class.java).apply {

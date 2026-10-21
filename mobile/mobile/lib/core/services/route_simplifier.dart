@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math' as math;
+import 'package:latlong2/latlong.dart';
 import 'gps_distance_calculator.dart';
 
 /// Point representation used during route simplification and chunk encoding
@@ -21,6 +22,8 @@ class RouteVertex {
     this.bearingDegrees,
     this.isGap = false,
   });
+
+  LatLng toLatLng() => LatLng(latitude, longitude);
 
   /// Serializes into a compact array: [lat, lng, epochSeconds, accuracy, speed, bearing, isGap]
   List<dynamic> toCompactList() {
@@ -63,75 +66,440 @@ class RouteVertex {
       'is_gap': isGap ? 1 : 0,
     };
   }
+
+  factory RouteVertex.fromMap(Map<String, dynamic> map) {
+    DateTime ts;
+    final recordedAt = map['recorded_at'] ?? map['captured_at'];
+    if (recordedAt != null) {
+      final str = '$recordedAt'.trim();
+      ts = str.endsWith('Z') || str.contains('+')
+          ? DateTime.parse(str).toUtc()
+          : DateTime.parse('${str}Z').toUtc();
+    } else {
+      ts = DateTime.now().toUtc();
+    }
+
+    return RouteVertex(
+      latitude: (map['latitude'] as num).toDouble(),
+      longitude: (map['longitude'] as num).toDouble(),
+      timestamp: ts,
+      accuracyMeters: map['accuracy_meters'] != null
+          ? (map['accuracy_meters'] as num).toDouble()
+          : (map['accuracy'] != null ? (map['accuracy'] as num).toDouble() : 5.0),
+      speedMps: map['speed_mps'] != null ? (map['speed_mps'] as num).toDouble() : (map['speed'] != null ? (map['speed'] as num).toDouble() : null),
+      bearingDegrees: map['bearing_degrees'] != null ? (map['bearing_degrees'] as num).toDouble() : (map['bearing'] != null ? (map['bearing'] as num).toDouble() : null),
+      isGap: map['is_gap'] == 1 || map['is_gap'] == true,
+    );
+  }
 }
 
-/// Production implementation of Ramer-Douglas-Peucker (RDP) algorithm with turn and gap protection.
-/// Minimizes permanent storage growth by retaining key geometry while omitting redundant linear points.
+/// Configuration options for hybrid route simplification pipeline
+class RouteSimplifierOptions {
+  /// Base perpendicular distance tolerance for Douglas-Peucker (in meters).
+  /// Recommended initial value: 0.5 - 1.0 meters.
+  final double baseEpsilonMeters;
+
+  /// Stricter perpendicular tolerance applied near turns, curves, and junctions (in meters).
+  final double turnEpsilonMeters;
+
+  /// Aggressive perpendicular tolerance applied along nearly straight segments (in meters).
+  final double straightEpsilonMeters;
+
+  /// Radial distance threshold (in meters) for Stage A pre-filtering.
+  final double radialPreFilterMeters;
+
+  /// Minimum angular direction change (in degrees) to classify a corner/turn (Stage C).
+  final double minTurnAngleDegrees;
+
+  /// Maximum permitted cross-track deviation (in meters) for Stage D validation.
+  final double maxAllowedDeviationMeters;
+
+  /// Minimum segment length (in meters) to evaluate bearing, resisting sensor noise.
+  final double minTurnSegmentDistanceMeters;
+
+  /// Maximum elapsed seconds without fixes before treating as a gap boundary (default: 900s = 15m).
+  final int gapDurationSeconds;
+
+  /// Protect directional reversals and small loops from collapsing.
+  final bool preserveLoops;
+
+  const RouteSimplifierOptions({
+    this.baseEpsilonMeters = 0.8,
+    this.turnEpsilonMeters = 0.4,
+    this.straightEpsilonMeters = 1.2,
+    this.radialPreFilterMeters = 1.0,
+    this.minTurnAngleDegrees = 15.0,
+    this.maxAllowedDeviationMeters = 2.5,
+    this.minTurnSegmentDistanceMeters = 2.5,
+    this.gapDurationSeconds = 900,
+    this.preserveLoops = true,
+  });
+
+  RouteSimplifierOptions copyWith({
+    double? baseEpsilonMeters,
+    double? turnEpsilonMeters,
+    double? straightEpsilonMeters,
+    double? radialPreFilterMeters,
+    double? minTurnAngleDegrees,
+    double? maxAllowedDeviationMeters,
+    double? minTurnSegmentDistanceMeters,
+    int? gapDurationSeconds,
+    bool? preserveLoops,
+  }) {
+    return RouteSimplifierOptions(
+      baseEpsilonMeters: baseEpsilonMeters ?? this.baseEpsilonMeters,
+      turnEpsilonMeters: turnEpsilonMeters ?? this.turnEpsilonMeters,
+      straightEpsilonMeters: straightEpsilonMeters ?? this.straightEpsilonMeters,
+      radialPreFilterMeters: radialPreFilterMeters ?? this.radialPreFilterMeters,
+      minTurnAngleDegrees: minTurnAngleDegrees ?? this.minTurnAngleDegrees,
+      maxAllowedDeviationMeters: maxAllowedDeviationMeters ?? this.maxAllowedDeviationMeters,
+      minTurnSegmentDistanceMeters: minTurnSegmentDistanceMeters ?? this.minTurnSegmentDistanceMeters,
+      gapDurationSeconds: gapDurationSeconds ?? this.gapDurationSeconds,
+      preserveLoops: preserveLoops ?? this.preserveLoops,
+    );
+  }
+}
+
+/// Result of hybrid route simplification
+class HybridSimplificationResult {
+  /// The simplified vertices to be rendered on the map
+  final List<RouteVertex> simplifiedVertices;
+
+  /// 0-indexed indices of the retained vertices within the original list
+  final List<int> originalIndices;
+
+  /// Original number of GPS points
+  final int originalPointCount;
+
+  /// Simplified number of GPS points
+  final int simplifiedPointCount;
+
+  /// Point reduction percentage (0.0% to 100.0%)
+  final double reductionPercentage;
+
+  /// Maximum measured geometric cross-track deviation across the entire route (in meters)
+  final double maxDeviationMeters;
+
+  /// Set of indices identifying all protected anchors (start, end, gaps, sharp turns, loops)
+  final Set<int> protectedIndices;
+
+  const HybridSimplificationResult({
+    required this.simplifiedVertices,
+    required this.originalIndices,
+    required this.originalPointCount,
+    required this.simplifiedPointCount,
+    required this.reductionPercentage,
+    required this.maxDeviationMeters,
+    required this.protectedIndices,
+  });
+
+  List<LatLng> toLatLngList() =>
+      simplifiedVertices.map((v) => LatLng(v.latitude, v.longitude)).toList();
+}
+
+/// Production implementation of Hybrid Route Simplification Pipeline
+/// Stage A: Radial Distance Pre-Filter
+/// Stage B: Adaptive Ramer-Douglas-Peucker (RDP)
+/// Stage C: Turning-Point & Anchor Protection
+/// Stage D: Maximum-Deviation Validation
 class RouteSimplifier {
   /// Default perpendicular distance tolerance (in meters).
-  /// 3.5m retains high-resolution curvature along winding roads while filtering redundant collinear points.
   final double epsilonMeters;
 
-  /// Minimum angular direction change (in degrees) to force vertex retention (protects street turns).
+  /// Minimum angular direction change (in degrees) to force vertex retention.
   final double minTurnAngleDegrees;
+
+  /// Configurable options
+  final RouteSimplifierOptions options;
 
   const RouteSimplifier({
     this.epsilonMeters = 3.5,
     this.minTurnAngleDegrees = 12.0,
+    this.options = const RouteSimplifierOptions(),
   });
 
+  /// Backward-compatible simplification entry point.
   /// Simplifies a candidate list of vertices, preserving start, end, road turns, and gaps.
   List<RouteVertex> simplify(List<RouteVertex> points) {
     if (points.length <= 2) return List.from(points);
+    final effectiveOptions = options.copyWith(
+      baseEpsilonMeters: epsilonMeters,
+      minTurnAngleDegrees: minTurnAngleDegrees,
+    );
+    return simplifyHybrid(points, effectiveOptions).simplifiedVertices;
+  }
 
-    // 1. Mark vertices that MUST be preserved (mandatory anchors)
-    final preservedIndices = <int>{0, points.length - 1};
+  /// Full 4-stage hybrid route simplification pipeline
+  static HybridSimplificationResult simplifyHybrid(
+    List<RouteVertex> points, [
+    RouteSimplifierOptions? options,
+  ]) {
+    final opts = options ?? const RouteSimplifierOptions();
+    final int n = points.length;
 
-    // Mark gap points (pause/resume boundaries)
-    for (int i = 0; i < points.length; i++) {
+    if (n == 0) {
+      return const HybridSimplificationResult(
+        simplifiedVertices: [],
+        originalIndices: [],
+        originalPointCount: 0,
+        simplifiedPointCount: 0,
+        reductionPercentage: 0.0,
+        maxDeviationMeters: 0.0,
+        protectedIndices: {},
+      );
+    }
+
+    if (n <= 2) {
+      return HybridSimplificationResult(
+        simplifiedVertices: List.from(points),
+        originalIndices: List.generate(n, (i) => i),
+        originalPointCount: n,
+        simplifiedPointCount: n,
+        reductionPercentage: 0.0,
+        maxDeviationMeters: 0.0,
+        protectedIndices: Set.from(List.generate(n, (i) => i)),
+      );
+    }
+
+    // =========================================================================
+    // STAGE C: Turning-Point and Anchor Protection
+    // Identify mandatory anchors before simplification:
+    // 1. Start and End of the entire journey
+    // 2. Gap boundaries (isGap flag or time difference > gapDurationSeconds)
+    // 3. Significant heading changes (noise-resistant windowed analysis)
+    // 4. Directional reversals and small loops
+    // =========================================================================
+    final protectedIndices = <int>{0, n - 1};
+
+    // 1. Detect gap boundaries
+    for (int i = 0; i < n; i++) {
       if (points[i].isGap) {
-        preservedIndices.add(i);
-        if (i > 0) preservedIndices.add(i - 1);
+        protectedIndices.add(i);
+        if (i > 0) protectedIndices.add(i - 1);
+      } else if (i > 0) {
+        final elapsed = points[i].timestamp.difference(points[i - 1].timestamp).inSeconds.abs();
+        if (elapsed >= opts.gapDurationSeconds) {
+          protectedIndices.add(i);
+          protectedIndices.add(i - 1);
+        }
       }
     }
 
-    // Mark significant direction changes (protect turns at street corners)
-    for (int i = 1; i < points.length - 1; i++) {
-      final prev = points[i - 1];
-      final curr = points[i];
-      final next = points[i + 1];
+    // 2. Noise-resistant turn and junction detection
+    // Uses a multi-point spatial lookback/lookahead to prevent GPS sensor jitter from triggering false turns
+    final turnIndices = <int>{};
+    for (int i = 1; i < n - 1; i++) {
+      if (protectedIndices.contains(i)) continue;
 
-      final bearing1 = _calculateBearing(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
-      final bearing2 = _calculateBearing(curr.latitude, curr.longitude, next.latitude, next.longitude);
+      // Find preceding point at least minTurnSegmentDistanceMeters away (or up to 3 points back)
+      int prevIdx = i - 1;
+      while (prevIdx > 0 &&
+          (i - prevIdx) < 3 &&
+          GpsDistanceCalculator.haversineDistanceMeters(
+                points[prevIdx].latitude,
+                points[prevIdx].longitude,
+                points[i].latitude,
+                points[i].longitude,
+              ) < opts.minTurnSegmentDistanceMeters) {
+        prevIdx--;
+      }
 
-      final angleDiff = _angularDifference(bearing1, bearing2);
-      if (angleDiff >= minTurnAngleDegrees) {
-        preservedIndices.add(i);
+      // Find succeeding point at least minTurnSegmentDistanceMeters away (or up to 3 points ahead)
+      int nextIdx = i + 1;
+      while (nextIdx < n - 1 &&
+          (nextIdx - i) < 3 &&
+          GpsDistanceCalculator.haversineDistanceMeters(
+                points[i].latitude,
+                points[i].longitude,
+                points[nextIdx].latitude,
+                points[nextIdx].longitude,
+              ) < opts.minTurnSegmentDistanceMeters) {
+        nextIdx++;
+      }
+
+      final distIn = GpsDistanceCalculator.haversineDistanceMeters(
+        points[prevIdx].latitude,
+        points[prevIdx].longitude,
+        points[i].latitude,
+        points[i].longitude,
+      );
+      final distOut = GpsDistanceCalculator.haversineDistanceMeters(
+        points[i].latitude,
+        points[i].longitude,
+        points[nextIdx].latitude,
+        points[nextIdx].longitude,
+      );
+
+      // Requires physical movement on both sides to eliminate sensor jitter
+      if (distIn >= opts.minTurnSegmentDistanceMeters && distOut >= opts.minTurnSegmentDistanceMeters) {
+        final bearing1 = _calculateBearing(
+          points[prevIdx].latitude,
+          points[prevIdx].longitude,
+          points[i].latitude,
+          points[i].longitude,
+        );
+        final bearing2 = _calculateBearing(
+          points[i].latitude,
+          points[i].longitude,
+          points[nextIdx].latitude,
+          points[nextIdx].longitude,
+        );
+
+        final turnAngle = _angularDifference(bearing1, bearing2);
+        if (turnAngle >= opts.minTurnAngleDegrees) {
+          protectedIndices.add(i);
+          turnIndices.add(i);
+        }
       }
     }
 
-    // 2. Run Douglas-Peucker algorithm between adjacent mandatory anchors
-    final sortedAnchors = preservedIndices.toList()..sort();
-    final resultIndices = <int>{};
+    // 3. Loop and reversal protection (preserving routes that retrace paths)
+    if (opts.preserveLoops) {
+      for (int i = 1; i < n - 1; i++) {
+        if (protectedIndices.contains(i)) continue;
+        final curr = points[i];
+        final prev = points[i - 1];
+        final next = points[i + 1];
+        final distIn = GpsDistanceCalculator.haversineDistanceMeters(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+        final distOut = GpsDistanceCalculator.haversineDistanceMeters(curr.latitude, curr.longitude, next.latitude, next.longitude);
+        if (distIn >= opts.minTurnSegmentDistanceMeters && distOut >= opts.minTurnSegmentDistanceMeters) {
+          final inBearing = _calculateBearing(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+          final outBearing = _calculateBearing(curr.latitude, curr.longitude, next.latitude, next.longitude);
+          if (_angularDifference(inBearing, outBearing) >= 120.0) {
+            protectedIndices.add(i);
+            turnIndices.add(i);
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // STAGE A: Radial Distance Pre-filter
+    // Filters redundant stationary/near-duplicate coordinates,
+    // ensuring protected anchors are NEVER removed.
+    // =========================================================================
+    final candidateIndices = <int>[0];
+    for (int i = 1; i < n - 1; i++) {
+      if (protectedIndices.contains(i)) {
+        candidateIndices.add(i);
+      } else {
+        final lastIdx = candidateIndices.last;
+        final dist = GpsDistanceCalculator.haversineDistanceMeters(
+          points[lastIdx].latitude,
+          points[lastIdx].longitude,
+          points[i].latitude,
+          points[i].longitude,
+        );
+        if (dist >= opts.radialPreFilterMeters) {
+          candidateIndices.add(i);
+        }
+      }
+    }
+    candidateIndices.add(n - 1);
+    final candidateSet = Set<int>.from(candidateIndices);
+
+    // Set of candidate indices to retain
+    final retainedIndicesSet = Set<int>.from(protectedIndices);
+
+    // =========================================================================
+    // STAGE B: Adaptive Ramer-Douglas-Peucker (RDP)
+    // Runs Douglas-Peucker between adjacent protected anchors.
+    // Uses turnEpsilon near curves and straightEpsilon on straight stretches.
+    // =========================================================================
+    final sortedAnchors = protectedIndices.toList()..sort();
 
     for (int a = 0; a < sortedAnchors.length - 1; a++) {
       final startIdx = sortedAnchors[a];
       final endIdx = sortedAnchors[a + 1];
-      _douglasPeuckerRecursive(points, startIdx, endIdx, resultIndices);
+
+      // Check if this segment contains a protected turn or curve
+      final isCurvedSegment = turnIndices.contains(startIdx) || turnIndices.contains(endIdx);
+      final segmentEpsilon = isCurvedSegment ? opts.turnEpsilonMeters : opts.straightEpsilonMeters;
+
+      _adaptiveRdpRecursive(
+        points: points,
+        startIdx: startIdx,
+        endIdx: endIdx,
+        epsilon: segmentEpsilon,
+        candidateSet: candidateSet,
+        retainedIndices: retainedIndicesSet,
+      );
     }
 
-    resultIndices.addAll(sortedAnchors);
-    final finalSorted = resultIndices.toList()..sort();
+    // =========================================================================
+    // STAGE D: Maximum-Deviation Validation
+    // Validates simplified segments against all original points.
+    // If any original point deviates by > maxAllowedDeviationMeters,
+    // restore the worst-violating point and re-validate iteratively.
+    // =========================================================================
+    double maxDeviationMeasured = 0.0;
+    var currentRetainedList = retainedIndicesSet.toList()..sort();
 
-    return finalSorted.map((idx) => points[idx]).toList();
+    int maxValidationPasses = 50; // Safety guard against infinite loops
+    while (maxValidationPasses-- > 0) {
+      double worstDeviation = 0.0;
+      int? worstViolatorIndex;
+
+      for (int i = 0; i < currentRetainedList.length - 1; i++) {
+        final sIdx = currentRetainedList[i];
+        final eIdx = currentRetainedList[i + 1];
+
+        // Evaluate all original points between sIdx and eIdx
+        for (int p = sIdx + 1; p < eIdx; p++) {
+          final dev = _perpendicularDistanceMeters(
+            points[p].latitude,
+            points[p].longitude,
+            points[sIdx].latitude,
+            points[sIdx].longitude,
+            points[eIdx].latitude,
+            points[eIdx].longitude,
+          );
+
+          if (dev > worstDeviation) {
+            worstDeviation = dev;
+            worstViolatorIndex = p;
+          }
+        }
+      }
+
+      if (worstDeviation > maxDeviationMeasured) {
+        maxDeviationMeasured = worstDeviation;
+      }
+
+      // If worst deviation exceeds permitted threshold, restore violator
+      if (worstDeviation > opts.maxAllowedDeviationMeters && worstViolatorIndex != null) {
+        retainedIndicesSet.add(worstViolatorIndex);
+        currentRetainedList = retainedIndicesSet.toList()..sort();
+      } else {
+        break; // Within permitted error bound
+      }
+    }
+
+    final finalIndices = retainedIndicesSet.toList()..sort();
+    final simplifiedVertices = finalIndices.map((idx) => points[idx]).toList();
+
+    final reduction = n > 0 ? ((n - simplifiedVertices.length) / n) * 100.0 : 0.0;
+
+    return HybridSimplificationResult(
+      simplifiedVertices: simplifiedVertices,
+      originalIndices: finalIndices,
+      originalPointCount: n,
+      simplifiedPointCount: simplifiedVertices.length,
+      reductionPercentage: reduction,
+      maxDeviationMeters: maxDeviationMeasured,
+      protectedIndices: protectedIndices,
+    );
   }
 
-  void _douglasPeuckerRecursive(
-    List<RouteVertex> points,
-    int startIdx,
-    int endIdx,
-    Set<int> retainedIndices,
-  ) {
+  /// Adaptive Ramer-Douglas-Peucker recursive worker
+  static void _adaptiveRdpRecursive({
+    required List<RouteVertex> points,
+    required int startIdx,
+    required int endIdx,
+    required double epsilon,
+    required Set<int> candidateSet,
+    required Set<int> retainedIndices,
+  }) {
     if (endIdx <= startIdx + 1) return;
 
     double maxDistance = 0.0;
@@ -141,6 +509,7 @@ class RouteSimplifier {
     final endPt = points[endIdx];
 
     for (int i = startIdx + 1; i < endIdx; i++) {
+      if (!candidateSet.contains(i)) continue;
       final dist = _perpendicularDistanceMeters(
         points[i].latitude,
         points[i].longitude,
@@ -156,11 +525,66 @@ class RouteSimplifier {
       }
     }
 
-    if (maxDistance > epsilonMeters) {
+    if (maxDistance > epsilon) {
       retainedIndices.add(indexFarthest);
-      _douglasPeuckerRecursive(points, startIdx, indexFarthest, retainedIndices);
-      _douglasPeuckerRecursive(points, indexFarthest, endIdx, retainedIndices);
+      _adaptiveRdpRecursive(
+        points: points,
+        startIdx: startIdx,
+        endIdx: indexFarthest,
+        epsilon: epsilon,
+        candidateSet: candidateSet,
+        retainedIndices: retainedIndices,
+      );
+      _adaptiveRdpRecursive(
+        points: points,
+        startIdx: indexFarthest,
+        endIdx: endIdx,
+        epsilon: epsilon,
+        candidateSet: candidateSet,
+        retainedIndices: retainedIndices,
+      );
     }
+  }
+
+  /// Convenience method to simplify a list of [LatLng] coordinates
+  static HybridSimplificationResult simplifyLatLngs(
+    List<LatLng> latLngs, {
+    RouteSimplifierOptions? options,
+    List<bool>? isGapList,
+    List<DateTime>? timestamps,
+  }) {
+    final now = DateTime.now().toUtc();
+    final vertices = List.generate(latLngs.length, (i) {
+      return RouteVertex(
+        latitude: latLngs[i].latitude,
+        longitude: latLngs[i].longitude,
+        timestamp: timestamps != null && i < timestamps.length
+            ? timestamps[i]
+            : now.add(Duration(seconds: i * 5)),
+        accuracyMeters: 5.0,
+        isGap: isGapList != null && i < isGapList.length ? isGapList[i] : false,
+      );
+    });
+
+    return simplifyHybrid(vertices, options);
+  }
+
+  /// Convenience method to simplify raw database coordinate maps
+  static HybridSimplificationResult simplifyRawMaps(
+    List<Map<String, dynamic>> rawMaps, [
+    RouteSimplifierOptions? options,
+  ]) {
+    final vertices = rawMaps.map((m) => RouteVertex.fromMap(m)).toList();
+    return simplifyHybrid(vertices, options);
+  }
+
+  /// Returns directly simplified display [LatLng] coordinates from raw database maps
+  static List<LatLng> getSimplifiedDisplayPoints(
+    List<Map<String, dynamic>> rawMaps, [
+    RouteSimplifierOptions? options,
+  ]) {
+    if (rawMaps.isEmpty) return [];
+    return simplifyRawMaps(rawMaps, options).toLatLngList();
   }
 
   /// Calculates perpendicular cross-track distance from point P to segment AB in meters
@@ -173,7 +597,7 @@ class RouteSimplifier {
     double bLng,
   ) {
     final distAB = GpsDistanceCalculator.haversineDistanceMeters(aLat, aLng, bLat, bLng);
-    if (distAB < 1.0) {
+    if (distAB < 0.2) {
       return GpsDistanceCalculator.haversineDistanceMeters(pLat, pLng, aLat, aLng);
     }
 

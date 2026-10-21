@@ -1,13 +1,15 @@
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, or_
 
 from app.database import get_db
 from app.models.user import User, UserRole
-from app.models.tracking import TrackingSession, GpsRoutePoint, TrackingRouteChunk
+from app.models.tracking import TrackingSession, GpsRoutePoint, TrackingRouteChunk, TrackingInterruptionEvent
+from app.models.shift import Shift, ShiftPunchPeriod
+from app.services.shift_service import ShiftService
 from app.schemas.tracking import (
     StartTrackingRequest,
     StartTrackingResponse,
@@ -32,11 +34,62 @@ from app.schemas.tracking import (
     TrackingStatisticsResponse,
     TrackingEventRequest,
     TrackingEventResponse,
+    ResolveShiftSessionRequest,
+    ResolveShiftSessionResponse,
+    TrackingHeartbeatRequest,
+    TrackingHeartbeatResponse,
+    RecordInterruptionRequest,
+    RecordRecoveryRequest,
+    SyncOfflineEventsRequest,
+    SyncOfflineEventsResponse,
+    TrackingInterruptionEventItem,
 )
 from app.dependencies import get_current_user, require_admin
 from app.services.geofence_service import is_valid_coordinate
+from app.services.route_simplification_service import RouteSimplificationService, RouteSimplificationOptions
 
 router = APIRouter(prefix="/api/tracking", tags=["GPS Journey Tracking"])
+
+
+def _resolve_shift_window(db: Session, user_id: int, target_date: date, shift_id: Optional[int] = None):
+    """Calculates effective shift, start time, end time, and timezone."""
+    shift = None
+    if shift_id:
+        shift = db.query(Shift).filter(Shift.id == shift_id).first()
+    if not shift:
+        shift = ShiftService.get_effective_shift_for_user(db=db, user_id=user_id, target_date=target_date)
+
+    if not shift:
+        return None, None, None
+
+    periods = shift.punch_periods or []
+    if not periods and shift.rules:
+        periods = shift.rules
+
+    if not periods:
+        return shift, None, None
+
+    min_start: Optional[time] = None
+    max_end: Optional[time] = None
+
+    for p in periods:
+        st = getattr(p, "start_time", None)
+        et = getattr(p, "end_time", None)
+        if st is not None:
+            if min_start is None or st < min_start:
+                min_start = st
+        if et is not None:
+            if max_end is None or et > max_end:
+                max_end = et
+
+    shift_start_dt = datetime.combine(target_date, min_start) if min_start else None
+    shift_end_dt = datetime.combine(target_date, max_end) if max_end else None
+
+    # Handle overnight shift
+    if shift_start_dt and shift_end_dt and shift_end_dt < shift_start_dt:
+        shift_end_dt += timedelta(days=1)
+
+    return shift, shift_start_dt, shift_end_dt
 
 
 @router.post("/start", response_model=StartTrackingResponse)
@@ -45,7 +98,8 @@ def start_tracking_session(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Start or retrieve an existing idempotent GPS tracking session for the authenticated user."""
+    """Start or retrieve an existing idempotent GPS tracking session for the authenticated user.
+    Guarantees ONE continuous tracking session per assigned shift."""
     # Enforce travel_map_enabled toggle
     if not getattr(current_user, "travel_map_enabled", True):
         raise HTTPException(
@@ -53,80 +107,109 @@ def start_tracking_session(
             detail="Travel Map / GPS Tracking is disabled for your account. Please contact your administrator."
         )
 
+    today = date.today()
+    shift, shift_start_dt, shift_end_dt = _resolve_shift_window(
+        db=db, user_id=current_user.id, target_date=today, shift_id=req.shift_id
+    )
+    resolved_shift_id = shift.id if shift else req.shift_id
+
     # 1. Idempotency check: see if session_uuid already exists
     existing = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
     if existing:
         if existing.user_id != current_user.id and current_user.role != UserRole.ADMIN:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized access to session.")
-        # Update starting coordinates if previously missing and now available
+        
+        # If recovering from interruption
+        if existing.status in ("INTERRUPTED", "DEGRADED", "RECOVERING"):
+            existing.status = "RECORDING"
+            # Auto-close open interruption events
+            open_events = db.query(TrackingInterruptionEvent).filter(
+                TrackingInterruptionEvent.session_id == existing.id,
+                TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+            ).all()
+            now_utc = datetime.utcnow()
+            for ev in open_events:
+                ev.recovered_at = now_utc
+                ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+                ev.recovery_outcome = "RECOVERED"
+
         if existing.start_latitude is None and is_valid_coordinate(req.start_latitude, req.start_longitude):
             existing.start_latitude = req.start_latitude
             existing.start_longitude = req.start_longitude
-            db.commit()
+        
+        existing.last_sync_time = datetime.utcnow()
+        existing.last_heartbeat_time = datetime.utcnow()
+        db.commit()
         return StartTrackingResponse(
             success=True,
-            message="Tracking session already active.",
+            message="Tracking session active.",
             session_id=existing.id,
             session_uuid=existing.session_uuid,
             status=existing.status,
         )
 
-    # 1b. Check if user already has an active RECORDING session for today to avoid start time mismatch
-    active_today = (
+    # 1b. SINGLE SESSION PER SHIFT: Check if user already has any active or recoverable session for today
+    recoverable_today = (
         db.query(TrackingSession)
         .filter(
             TrackingSession.user_id == current_user.id,
-            TrackingSession.work_date == date.today(),
-            TrackingSession.status == "RECORDING",
+            TrackingSession.work_date == today,
+            TrackingSession.status.in_(["RECORDING", "ACTIVE", "PAUSED", "INTERRUPTED", "DEGRADED", "RECOVERING", "SCHEDULED"]),
         )
         .order_by(TrackingSession.start_time.asc())
         .first()
     )
-    if active_today:
-        if active_today.start_latitude is None and is_valid_coordinate(req.start_latitude, req.start_longitude):
-            active_today.start_latitude = req.start_latitude
-            active_today.start_longitude = req.start_longitude
-            pt1_exists = db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == active_today.id).first()
-            if not pt1_exists:
-                init_point = GpsRoutePoint(
-                    session_id=active_today.id,
-                    user_id=current_user.id,
-                    client_point_id=f"{active_today.session_uuid}_pt_1",
-                    sequence_number=1,
-                    latitude=float(req.start_latitude),
-                    longitude=float(req.start_longitude),
-                    accuracy_meters=float(req.start_accuracy_meters) if req.start_accuracy_meters is not None else 10.0,
-                    altitude_meters=float(req.start_altitude_meters) if req.start_altitude_meters is not None else 0.0,
-                    speed_mps=float(req.start_speed_mps) if req.start_speed_mps is not None else 0.0,
-                    bearing_degrees=float(req.start_bearing_degrees) if req.start_bearing_degrees is not None else 0.0,
-                    recorded_at=req.start_time or datetime.utcnow(),
-                    is_gap=0,
-                    sync_status="SYNCED",
-                )
-                db.add(init_point)
-            db.commit()
-            db.refresh(active_today)
+    if recoverable_today:
+        # Recover the existing session instead of duplicating
+        now_utc = datetime.utcnow()
+        if recoverable_today.status in ("INTERRUPTED", "DEGRADED", "RECOVERING"):
+            recoverable_today.status = "RECORDING"
+            open_events = db.query(TrackingInterruptionEvent).filter(
+                TrackingInterruptionEvent.session_id == recoverable_today.id,
+                TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+            ).all()
+            for ev in open_events:
+                ev.recovered_at = now_utc
+                ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+                ev.recovery_outcome = "RECOVERED"
+
+        if recoverable_today.start_latitude is None and is_valid_coordinate(req.start_latitude, req.start_longitude):
+            recoverable_today.start_latitude = req.start_latitude
+            recoverable_today.start_longitude = req.start_longitude
+
+        recoverable_today.last_sync_time = now_utc
+        recoverable_today.last_heartbeat_time = now_utc
+        db.commit()
+        db.refresh(recoverable_today)
+
         return StartTrackingResponse(
             success=True,
-            message="Resumed active duty tracking session for today.",
-            session_id=active_today.id,
-            session_uuid=active_today.session_uuid,
-            status=active_today.status,
+            message="Resumed active continuous shift tracking session.",
+            session_id=recoverable_today.id,
+            session_uuid=recoverable_today.session_uuid,
+            status=recoverable_today.status,
         )
 
-    # 2. Create new tracking session
+    # 2. Create new single tracking session for this shift
+    now_utc = req.start_time or datetime.utcnow()
     session = TrackingSession(
         session_uuid=req.session_uuid,
         user_id=current_user.id,
         attendance_id=req.attendance_id,
-        shift_id=req.shift_id,
-        work_date=date.today(),
-        start_time=req.start_time or datetime.utcnow(),
+        shift_id=resolved_shift_id,
+        shift_start_time=shift_start_dt,
+        shift_end_time=shift_end_dt,
+        actual_start_time=now_utc,
+        work_date=today,
+        start_time=now_utc,
         status="RECORDING",
         start_latitude=req.start_latitude,
         start_longitude=req.start_longitude,
         total_distance_meters=0.0,
         total_duration_seconds=0,
+        tracking_completeness="COMPLETE",
+        last_heartbeat_time=now_utc,
+        last_sync_time=now_utc,
     )
     db.add(session)
     db.commit()
@@ -438,6 +521,450 @@ def resume_tracking_session(
     )
 
 
+@router.post("/resolve-shift-session", response_model=ResolveShiftSessionResponse)
+def resolve_shift_session(
+    req: ResolveShiftSessionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Deterministically resolves the single continuous tracking session for the employee's shift.
+    Guarantees that no duplicate sessions exist for the same employee, shift, and work date."""
+    target_date = req.work_date or req.target_date or date.today()
+    shift, shift_start_dt, shift_end_dt = _resolve_shift_window(
+        db=db, user_id=current_user.id, target_date=target_date, shift_id=req.shift_id
+    )
+    resolved_shift_id = shift.id if shift else req.shift_id
+
+    # Deterministic canonical session UUID
+    canonical_uuid = f"TRACK_{current_user.id}_SHIFT_{resolved_shift_id or 'GENERAL'}_{target_date}"
+
+    # Search for any active/recoverable session for this user and work_date
+    existing = (
+        db.query(TrackingSession)
+        .filter(
+            TrackingSession.user_id == current_user.id,
+            TrackingSession.work_date == target_date,
+            TrackingSession.status.in_(["RECORDING", "ACTIVE", "PAUSED", "INTERRUPTED", "DEGRADED", "RECOVERING", "SCHEDULED"]),
+        )
+        .order_by(TrackingSession.start_time.asc())
+        .first()
+    )
+
+    is_new = False
+    now_utc = datetime.utcnow()
+
+    if existing:
+        session = existing
+        # Re-activate if interrupted
+        if session.status in ("INTERRUPTED", "DEGRADED", "RECOVERING"):
+            session.status = "RECORDING"
+            open_events = db.query(TrackingInterruptionEvent).filter(
+                TrackingInterruptionEvent.session_id == session.id,
+                TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+            ).all()
+            for ev in open_events:
+                ev.recovered_at = now_utc
+                ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+                ev.recovery_outcome = "RECOVERED"
+        session.last_heartbeat_time = now_utc
+        session.last_sync_time = now_utc
+        if req.device_id and not session.device_id:
+            session.device_id = req.device_id
+        db.commit()
+    else:
+        is_new = True
+        session = TrackingSession(
+            session_uuid=canonical_uuid,
+            user_id=current_user.id,
+            shift_id=resolved_shift_id,
+            shift_start_time=shift_start_dt,
+            shift_end_time=shift_end_dt,
+            actual_start_time=now_utc,
+            work_date=target_date,
+            start_time=now_utc,
+            status="RECORDING",
+            start_latitude=req.start_latitude,
+            start_longitude=req.start_longitude,
+            total_distance_meters=0.0,
+            total_duration_seconds=0,
+            tracking_completeness="COMPLETE",
+            device_id=req.device_id,
+            last_heartbeat_time=now_utc,
+            last_sync_time=now_utc,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    # Check for active unresolved interruption
+    active_ev = db.query(TrackingInterruptionEvent).filter(
+        TrackingInterruptionEvent.session_id == session.id,
+        TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+    ).order_by(desc(TrackingInterruptionEvent.detected_at)).first()
+
+    ev_item = None
+    if active_ev:
+        ev_item = TrackingInterruptionEventItem.model_validate(active_ev)
+
+    cnt = session.retained_point_count if (session.retained_point_count and session.retained_point_count > 0) else db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == session.id).count()
+
+    return ResolveShiftSessionResponse(
+        success=True,
+        session_id=session.id,
+        session_uuid=session.session_uuid,
+        status=session.status,
+        is_new=is_new,
+        shift_id=session.shift_id,
+        shift_name=shift.shift_name if shift else None,
+        shift_start_time=session.shift_start_time,
+        shift_end_time=session.shift_end_time,
+        total_distance_meters=float(session.total_distance_meters),
+        accepted_point_count=cnt,
+        tracking_completeness=session.tracking_completeness or "COMPLETE",
+        active_interruption=ev_item,
+        message="Shift tracking session active and ready.",
+    )
+
+
+@router.post("/heartbeat", response_model=TrackingHeartbeatResponse)
+def record_tracking_heartbeat(
+    req: TrackingHeartbeatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Periodic health heartbeat from background tracking service.
+    Detects gaps, validates shift window, and manages interruption events."""
+    session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    if not session:
+        # Auto-recover session from shift window
+        shift, s_start, s_end = _resolve_shift_window(db=db, user_id=current_user.id, target_date=date.today())
+        now_utc = req.timestamp or datetime.utcnow()
+        session = TrackingSession(
+            session_uuid=req.session_uuid,
+            user_id=current_user.id,
+            shift_id=shift.id if shift else None,
+            shift_start_time=s_start,
+            shift_end_time=s_end,
+            actual_start_time=now_utc,
+            work_date=date.today(),
+            start_time=now_utc,
+            status="RECORDING",
+            total_distance_meters=0.0,
+            total_duration_seconds=0,
+            tracking_completeness="COMPLETE",
+            device_id=None,
+            last_heartbeat_time=now_utc,
+            last_sync_time=now_utc,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized access to session.")
+
+    now_utc = req.timestamp or datetime.utcnow()
+    session.last_heartbeat_time = now_utc
+    session.last_sync_time = now_utc
+
+    should_stop = False
+    # Check if shift ended
+    if session.shift_end_time and now_utc >= session.shift_end_time:
+        should_stop = True
+
+    # Detect location services disabled reported via heartbeat
+    if req.location_services_enabled is False or req.gps_provider_enabled is False:
+        # Check if an unresolved event already exists
+        existing_ev = db.query(TrackingInterruptionEvent).filter(
+            TrackingInterruptionEvent.session_id == session.id,
+            TrackingInterruptionEvent.reason_code == "LOCATION_SERVICES_DISABLED",
+            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+        ).first()
+        if not existing_ev:
+            ev = TrackingInterruptionEvent(
+                event_uuid=f"EV_HEARTBEAT_LOC_OFF_{session.id}_{int(now_utc.timestamp())}",
+                session_id=session.id,
+                session_uuid=session.session_uuid,
+                user_id=current_user.id,
+                device_id=req.device_id or session.device_id,
+                reason_code="LOCATION_SERVICES_DISABLED",
+                description="Location services reported disabled in service heartbeat",
+                severity="WARNING",
+                detected_at=now_utc,
+                last_known_latitude=session.last_accepted_latitude,
+                last_known_longitude=session.last_accepted_longitude,
+                last_known_location_time=session.last_accepted_time,
+                is_confirmed=1,
+                recovery_outcome="UNRESOLVED",
+            )
+            db.add(ev)
+            session.status = "INTERRUPTED"
+            session.tracking_completeness = "HAS_GAPS"
+    elif req.location_services_enabled is True and req.gps_provider_enabled is True:
+        # Auto-recover location disabled event if still unresolved
+        open_loc_ev = db.query(TrackingInterruptionEvent).filter(
+            TrackingInterruptionEvent.session_id == session.id,
+            TrackingInterruptionEvent.reason_code == "LOCATION_SERVICES_DISABLED",
+            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+        ).first()
+        if open_loc_ev:
+            open_loc_ev.recovered_at = now_utc
+            open_loc_ev.duration_seconds = max(0, int((now_utc - open_loc_ev.detected_at).total_seconds()))
+            open_loc_ev.recovery_outcome = "RECOVERED"
+            if session.status == "INTERRUPTED":
+                session.status = "RECORDING"
+
+    db.commit()
+    return TrackingHeartbeatResponse(
+        success=True,
+        server_time=now_utc,
+        session_status=session.status,
+        should_stop=should_stop,
+        message="Heartbeat recorded successfully.",
+    )
+
+
+@router.post("/interruption", response_model=TrackingInterruptionEventItem)
+def record_interruption_event(
+    req: RecordInterruptionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Records an explicit tracking interruption event (e.g. GPS disabled, accuracy failure, permission revoked)."""
+    session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    if not session:
+        # Auto-recover session if missing
+        session = TrackingSession(
+            session_uuid=req.session_uuid,
+            user_id=current_user.id,
+            work_date=date.today(),
+            start_time=req.detected_at,
+            status="INTERRUPTED",
+            tracking_completeness="HAS_GAPS",
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot log interruption on another user's session.")
+
+    # Idempotent check by event_uuid
+    existing_ev = db.query(TrackingInterruptionEvent).filter(
+        TrackingInterruptionEvent.event_uuid == req.event_uuid
+    ).first()
+
+    if existing_ev:
+        return TrackingInterruptionEventItem.from_orm(existing_ev)
+
+    ev = TrackingInterruptionEvent(
+        event_uuid=req.event_uuid,
+        session_id=session.id,
+        session_uuid=session.session_uuid,
+        user_id=current_user.id,
+        device_id=req.device_id or session.device_id,
+        reason_code=req.reason_code,
+        description=req.description,
+        severity=req.severity or "WARNING",
+        detected_at=req.detected_at,
+        last_known_latitude=req.last_known_latitude or session.last_accepted_latitude,
+        last_known_longitude=req.last_known_longitude or session.last_accepted_longitude,
+        last_known_location_time=req.last_known_location_time or session.last_accepted_time,
+        diagnostic_details=json.dumps(req.diagnostic_details) if isinstance(req.diagnostic_details, dict) else req.diagnostic_details,
+        is_confirmed=1 if req.is_confirmed else 0,
+        recovery_outcome="UNRESOLVED",
+    )
+    db.add(ev)
+
+    # Transition session status
+    if req.reason_code == "POOR_ACCURACY":
+        if session.status != "INTERRUPTED":
+            session.status = "DEGRADED"
+    else:
+        session.status = "INTERRUPTED"
+        session.tracking_completeness = "HAS_GAPS"
+
+    session.updated_at = req.detected_at
+    db.commit()
+    db.refresh(ev)
+
+    return TrackingInterruptionEventItem.model_validate(ev)
+
+
+@router.post("/recovery", response_model=TrackingInterruptionEventItem)
+def record_recovery_event(
+    req: RecordRecoveryRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Closes an open interruption event and transitions session back to ACTIVE/RECORDING."""
+    session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tracking session not found.")
+
+    if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot record recovery on another user's session.")
+
+    query = db.query(TrackingInterruptionEvent).filter(
+        TrackingInterruptionEvent.session_id == session.id,
+        TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+    )
+    if req.event_uuid:
+        query = query.filter(TrackingInterruptionEvent.event_uuid == req.event_uuid)
+    elif req.reason_code:
+        query = query.filter(TrackingInterruptionEvent.reason_code == req.reason_code)
+
+    target_ev = query.order_by(desc(TrackingInterruptionEvent.detected_at)).first()
+    if not target_ev:
+        # Fallback to the latest open event for this session
+        target_ev = db.query(TrackingInterruptionEvent).filter(
+            TrackingInterruptionEvent.session_id == session.id,
+            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+        ).order_by(desc(TrackingInterruptionEvent.detected_at)).first()
+
+    now_utc = req.recovered_at or datetime.utcnow()
+
+    if target_ev:
+        target_ev.recovered_at = now_utc
+        target_ev.duration_seconds = max(0, int((now_utc - target_ev.detected_at).total_seconds()))
+        target_ev.recovery_outcome = req.recovery_outcome or "RECOVERED"
+        if req.diagnostic_details:
+            target_ev.diagnostic_details = req.diagnostic_details
+
+    # Check if any remaining open events exist
+    remaining_open = db.query(TrackingInterruptionEvent.id).filter(
+        TrackingInterruptionEvent.session_id == session.id,
+        TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+    ).first()
+
+    if not remaining_open:
+        session.status = "RECORDING"
+
+    session.updated_at = now_utc
+    session.last_sync_time = now_utc
+    db.commit()
+
+    if target_ev:
+        db.refresh(target_ev)
+        return TrackingInterruptionEventItem.model_validate(target_ev)
+    else:
+        # Return synthetic confirmed recovery item
+        synthetic = TrackingInterruptionEvent(
+            id=0,
+            event_uuid=f"RECOVERED_{session.id}_{int(now_utc.timestamp())}",
+            session_id=session.id,
+            session_uuid=session.session_uuid,
+            user_id=current_user.id,
+            reason_code=req.reason_code or "SERVICE_RESUMED",
+            description="Tracking recovered",
+            severity="INFO",
+            detected_at=now_utc,
+            recovered_at=now_utc,
+            duration_seconds=0,
+            recovery_outcome="RECOVERED",
+        )
+        return TrackingInterruptionEventItem.model_validate(synthetic)
+
+
+@router.post("/sync-offline-events", response_model=SyncOfflineEventsResponse)
+def sync_offline_events(
+    req: SyncOfflineEventsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Batch-synchronizes interruption events that were recorded locally while offline."""
+    session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    if not session:
+        # Auto-recover/initialize session from shift window
+        shift, s_start, s_end = _resolve_shift_window(db=db, user_id=current_user.id, target_date=date.today())
+        now_utc = datetime.utcnow()
+        session = TrackingSession(
+            session_uuid=req.session_uuid,
+            user_id=current_user.id,
+            shift_id=shift.id if shift else None,
+            shift_start_time=s_start,
+            shift_end_time=s_end,
+            actual_start_time=now_utc,
+            work_date=date.today(),
+            start_time=now_utc,
+            status="RECORDING",
+            total_distance_meters=0.0,
+            total_duration_seconds=0,
+            tracking_completeness="PENDING_SYNC",
+            device_id=None,
+            last_heartbeat_time=now_utc,
+            last_sync_time=now_utc,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    synced_count = 0
+    synced_ids = []
+    for ev_data in req.events:
+        synced_ids.append(ev_data.event_uuid)
+        exists = db.query(TrackingInterruptionEvent.id).filter(
+            TrackingInterruptionEvent.event_uuid == ev_data.event_uuid
+        ).first()
+        if exists:
+            continue
+
+        diag_str = json.dumps(ev_data.diagnostic_details) if isinstance(ev_data.diagnostic_details, dict) else ev_data.diagnostic_details
+        ev = TrackingInterruptionEvent(
+            event_uuid=ev_data.event_uuid,
+            session_id=session.id,
+            session_uuid=session.session_uuid,
+            user_id=current_user.id,
+            device_id=ev_data.device_id or session.device_id,
+            reason_code=ev_data.reason_code,
+            description=ev_data.description,
+            severity=ev_data.severity or "WARNING",
+            detected_at=ev_data.detected_at,
+            last_known_latitude=ev_data.last_known_latitude or session.last_accepted_latitude,
+            last_known_longitude=ev_data.last_known_longitude or session.last_accepted_longitude,
+            last_known_location_time=ev_data.last_known_location_time or session.last_accepted_time,
+            diagnostic_details=diag_str,
+            is_confirmed=1 if ev_data.is_confirmed else 0,
+            recovery_outcome="UNRESOLVED",
+        )
+        db.add(ev)
+        synced_count += 1
+        if ev_data.severity in ("WARNING", "CRITICAL"):
+            session.tracking_completeness = "HAS_GAPS"
+
+    session.last_sync_time = datetime.utcnow()
+    db.commit()
+    return SyncOfflineEventsResponse(
+        success=True,
+        synced_count=synced_count,
+        synced_event_ids=synced_ids,
+        message=f"Synced {synced_count} offline interruption events.",
+    )
+
+
+@router.get("/sessions/{session_id}/interruptions", response_model=List[TrackingInterruptionEventItem])
+def get_session_interruptions(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retrieves full chronological interruption history for a tracking session."""
+    session = db.query(TrackingSession).filter(TrackingSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tracking session not found.")
+
+    if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized access to interruptions.")
+
+    events = (
+        db.query(TrackingInterruptionEvent)
+        .filter(TrackingInterruptionEvent.session_id == session.id)
+        .order_by(TrackingInterruptionEvent.detected_at.asc())
+        .all()
+    )
+    return [TrackingInterruptionEventItem.model_validate(e) for e in events]
+
+
 @router.post("/stop", response_model=StopTrackingResponse)
 def stop_tracking_session(
     req: StopTrackingRequest,
@@ -446,15 +973,19 @@ def stop_tracking_session(
 ):
     """Conclude an active GPS tracking session and record final stats."""
     session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    now_utc = req.end_time or datetime.utcnow()
+
     if not session:
         # Auto-recover / conclude session even if /start was not received first
         session = TrackingSession(
             session_uuid=req.session_uuid,
             user_id=current_user.id,
             work_date=date.today(),
-            start_time=datetime.utcnow(),
+            start_time=now_utc,
+            actual_start_time=now_utc,
+            actual_stop_time=now_utc,
             status="COMPLETED",
-            end_time=req.end_time or datetime.utcnow(),
+            end_time=now_utc,
             end_latitude=req.end_latitude,
             end_longitude=req.end_longitude,
             total_distance_meters=req.total_distance_meters or 0.0,
@@ -476,7 +1007,9 @@ def stop_tracking_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot conclude another user's session.")
 
     session.status = "COMPLETED"
-    session.end_time = req.end_time or datetime.utcnow()
+    session.end_time = now_utc
+    session.actual_stop_time = now_utc
+
     if req.end_latitude is not None:
         session.end_latitude = req.end_latitude
     if req.end_longitude is not None:
@@ -485,6 +1018,16 @@ def stop_tracking_session(
         session.total_distance_meters = req.total_distance_meters
     if req.total_duration_seconds is not None:
         session.total_duration_seconds = req.total_duration_seconds
+
+    # Auto-conclude any open interruption events
+    open_events = db.query(TrackingInterruptionEvent).filter(
+        TrackingInterruptionEvent.session_id == session.id,
+        TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+    ).all()
+    for ev in open_events:
+        ev.recovered_at = now_utc
+        ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+        ev.recovery_outcome = "SHIFT_CONCLUDED"
 
     db.commit()
     db.refresh(session)
@@ -512,11 +1055,42 @@ def log_tracking_event(
     if session:
         if req.event_type == "GPS_DISABLED":
             session.status = "INTERRUPTED"
+            session.tracking_completeness = "HAS_GAPS"
             session.updated_at = now
+            # Record interruption event
+            ev_uuid = f"EV_GPS_OFF_{session.id}_{int(now.timestamp())}"
+            exists = db.query(TrackingInterruptionEvent.id).filter(TrackingInterruptionEvent.event_uuid == ev_uuid).first()
+            if not exists:
+                ev = TrackingInterruptionEvent(
+                    event_uuid=ev_uuid,
+                    session_id=session.id,
+                    session_uuid=session.session_uuid,
+                    user_id=current_user.id,
+                    device_id=session.device_id,
+                    reason_code="LOCATION_SERVICES_DISABLED",
+                    description=req.details or "Location provider disabled by user",
+                    severity="WARNING",
+                    detected_at=now,
+                    last_known_latitude=session.last_accepted_latitude,
+                    last_known_longitude=session.last_accepted_longitude,
+                    last_known_location_time=session.last_accepted_time,
+                    is_confirmed=1,
+                    recovery_outcome="UNRESOLVED",
+                )
+                db.add(ev)
             db.commit()
-        elif req.event_type in ("SERVICE_RESUMED", "GPS_RESTORED") and session.status == "INTERRUPTED":
+        elif req.event_type in ("SERVICE_RESUMED", "GPS_RESTORED") and session.status in ("INTERRUPTED", "DEGRADED"):
             session.status = "RECORDING"
             session.updated_at = now
+            # Close open events
+            open_evs = db.query(TrackingInterruptionEvent).filter(
+                TrackingInterruptionEvent.session_id == session.id,
+                TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+            ).all()
+            for o_ev in open_evs:
+                o_ev.recovered_at = now
+                o_ev.duration_seconds = max(0, int((now - o_ev.detected_at).total_seconds()))
+                o_ev.recovery_outcome = "RECOVERED"
             db.commit()
 
     import logging
@@ -531,7 +1105,6 @@ def log_tracking_event(
     )
 
 
-
 @router.get("/sessions", response_model=List[TrackingSessionSummary])
 def list_tracking_sessions(
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
@@ -540,7 +1113,7 @@ def list_tracking_sessions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List tracking sessions. Non-admins can only see their own sessions."""
+    """List tracking sessions with shift context and interruption diagnostics."""
     query = db.query(TrackingSession)
 
     if current_user.role != UserRole.ADMIN:
@@ -563,6 +1136,17 @@ def list_tracking_sessions(
     summaries = []
     for s in sessions:
         cnt = s.retained_point_count if (s.retained_point_count and s.retained_point_count > 0) else db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == s.id).count()
+        
+        # Interruption summary
+        interruption_count = db.query(TrackingInterruptionEvent.id).filter(TrackingInterruptionEvent.session_id == s.id).count()
+        active_interruption = db.query(TrackingInterruptionEvent.reason_code).filter(
+            TrackingInterruptionEvent.session_id == s.id,
+            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+        ).order_by(desc(TrackingInterruptionEvent.detected_at)).first()
+
+        shift_code = s.shift.shift_code if s.shift else None
+        shift_name = s.shift.shift_name if s.shift else None
+
         summaries.append(
             TrackingSessionSummary(
                 id=s.id,
@@ -581,6 +1165,17 @@ def list_tracking_sessions(
                 total_distance_meters=float(s.total_distance_meters),
                 total_duration_seconds=int(s.total_duration_seconds),
                 point_count=cnt,
+                shift_id=s.shift_id,
+                shift_code=shift_code,
+                shift_name=shift_name,
+                shift_start_time=s.shift_start_time,
+                shift_end_time=s.shift_end_time,
+                last_accepted_time=s.last_accepted_time,
+                last_heartbeat_time=s.last_heartbeat_time,
+                last_sync_time=s.last_sync_time,
+                tracking_completeness=s.tracking_completeness or "COMPLETE",
+                active_interruption=active_interruption[0] if active_interruption else None,
+                interruption_count=interruption_count,
             )
         )
     return summaries
@@ -590,11 +1185,15 @@ def list_tracking_sessions(
 def get_session_route(
     session_id: int,
     raw: bool = Query(True, description="Return raw GPS points if True (default), or simplified if False"),
+    simplified: Optional[bool] = Query(None, description="Explicitly request hybrid simplified route if True"),
+    epsilon: Optional[float] = Query(None, description="Configurable RDP base tolerance in meters (default 0.8)"),
+    max_deviation: Optional[float] = Query(None, description="Configurable max deviation in meters (default 2.5)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Retrieve full ordered GPS route. By default returns all raw points so refreshes never lose points.
-    If raw=false is specified, returns simplified candidate vertices."""
+    If raw=false or simplified=true is specified, returns hybrid simplified candidate vertices for clean map rendering
+    while preserving original database records."""
     session = db.query(TrackingSession).filter(TrackingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tracking session not found.")
@@ -605,15 +1204,43 @@ def get_session_route(
     point_details: List[RoutePointDetail] = []
     is_raw_route = False
 
-    # 1. If raw is requested (default): retrieve all raw GPS points from gps_route_points
-    if raw:
-        raw_points = (
-            db.query(GpsRoutePoint)
-            .filter(GpsRoutePoint.session_id == session.id)
-            .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
-            .all()
-        )
-        if raw_points:
+    want_simplified = (simplified is True) or (not raw)
+
+    # 1. Fetch raw points from database
+    raw_points = (
+        db.query(GpsRoutePoint)
+        .filter(GpsRoutePoint.session_id == session.id)
+        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+        .all()
+    )
+
+    if raw_points:
+        if want_simplified and len(raw_points) > 2:
+            options = RouteSimplificationOptions(
+                base_epsilon_meters=epsilon if epsilon is not None else 0.8,
+                max_allowed_deviation_meters=max_deviation if max_deviation is not None else 2.5,
+            )
+            sim_res = RouteSimplificationService.simplify_points(raw_points, options)
+            point_details = [
+                RoutePointDetail(
+                    id=p.id,
+                    sequence_number=p.sequence_number,
+                    client_point_id=p.client_point_id,
+                    employee_id=p.employee_id or (session.user.employee_id if session.user else None),
+                    device_id=p.device_id or (session.user.device_id if session.user else None),
+                    latitude=float(p.latitude),
+                    longitude=float(p.longitude),
+                    accuracy_meters=float(p.accuracy_meters),
+                    altitude_meters=float(p.altitude_meters) if p.altitude_meters else None,
+                    speed_mps=float(p.speed_mps) if p.speed_mps else None,
+                    bearing_degrees=float(p.bearing_degrees) if p.bearing_degrees else None,
+                    recorded_at=p.recorded_at,
+                    is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
+                )
+                for p in sim_res.simplified_points
+            ]
+            is_raw_route = False
+        else:
             point_details = [
                 RoutePointDetail(
                     id=p.id,
@@ -722,6 +1349,15 @@ def get_session_route(
         total_distance_meters=float(session.total_distance_meters),
         total_duration_seconds=int(session.total_duration_seconds),
         point_count=effective_point_count,
+        shift_id=session.shift_id,
+        shift_code=session.shift.shift_code if session.shift else None,
+        shift_name=session.shift.shift_name if session.shift else None,
+        shift_start_time=session.shift_start_time,
+        shift_end_time=session.shift_end_time,
+        last_accepted_time=session.last_accepted_time,
+        last_heartbeat_time=session.last_heartbeat_time,
+        last_sync_time=session.last_sync_time,
+        tracking_completeness=session.tracking_completeness or "COMPLETE",
     )
 
     return TrackingRouteResponse(

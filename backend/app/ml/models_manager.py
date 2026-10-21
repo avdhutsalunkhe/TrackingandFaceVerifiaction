@@ -57,7 +57,44 @@ class ModelsManager:
 
         print(f"[ModelsManager] Face Detector:   {det_mode}")
         print(f"[ModelsManager] Face Recognizer: {rec_mode}")
-        print(f"[ModelsManager] Liveness Engine: {live_mode}")
+        self.is_warmed_up = False
+
+    def warmup(self):
+        """
+        Execute controlled dummy forward passes across all models during startup.
+        Initializes ONNX runtime execution graphs, memory arenas, kernel selectors,
+        and OpenCV worker threads to eliminate the 200+ ms cold start penalty on first request.
+        """
+        if self.is_warmed_up:
+            return
+
+        import cv2
+        import numpy as np
+        from app.ml.alignment import align_face_112
+        from app.ml.preprocessing import normalize_face_crop_illumination
+
+        try:
+            # 1. Warm up SCRFD detector
+            dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            cv2.circle(dummy_img, (320, 320), 120, (180, 180, 180), -1)
+            cv2.putText(dummy_img, "WARMUP", (240, 330), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (50, 50, 50), 2)
+            self.detector.detect(dummy_img)
+
+            # 2. Warm up 5-point Umeyama alignment & OpenCV CLAHE
+            dummy_lm = np.array([[220, 240], [340, 240], [280, 290], [240, 350], [320, 350]], dtype=np.float32)
+            aligned = align_face_112(dummy_img, dummy_lm)
+            norm_aligned = normalize_face_crop_illumination(aligned)
+
+            # 3. Warm up ArcFace recognizer
+            self.recognizer.extract_embedding(norm_aligned)
+
+            # 4. Warm up Anti-Spoofing engine
+            self.liveness.evaluate_passive_antispoof(norm_aligned)
+
+            self.is_warmed_up = True
+            print("[ModelsManager] Controlled model warmup completed successfully.")
+        except Exception as e:
+            print(f"[ModelsManager] Model warmup warning: {e}")
 
     @classmethod
     def get_instance(cls) -> 'ModelsManager':

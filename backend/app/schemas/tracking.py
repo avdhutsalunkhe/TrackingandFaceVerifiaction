@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Union, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -175,9 +175,134 @@ class TrackingSessionSummary(BaseModel):
     total_distance_meters: float
     total_duration_seconds: int
     point_count: int = 0
+    shift_id: Optional[int] = None
+    shift_code: Optional[str] = None
+    shift_name: Optional[str] = None
+    shift_start_time: Optional[datetime] = None
+    shift_end_time: Optional[datetime] = None
+    last_accepted_time: Optional[datetime] = None
+    last_heartbeat_time: Optional[datetime] = None
+    last_sync_time: Optional[datetime] = None
+    tracking_completeness: Optional[str] = "COMPLETE"
+    active_interruption: Optional[str] = None
+    interruption_count: Optional[int] = 0
 
     class Config:
         from_attributes = True
+
+
+class TrackingInterruptionEventItem(BaseModel):
+    id: int
+    event_uuid: str
+    session_id: int
+    session_uuid: str
+    user_id: int
+    device_id: Optional[str] = None
+    reason_code: str
+    description: str
+    severity: str
+    detected_at: datetime
+    recovered_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    last_known_latitude: Optional[float] = None
+    last_known_longitude: Optional[float] = None
+    last_known_location_time: Optional[datetime] = None
+    diagnostic_details: Optional[str] = None
+    is_confirmed: bool = True
+    recovery_outcome: str
+
+    class Config:
+        from_attributes = True
+
+
+class ResolveShiftSessionRequest(BaseModel):
+    shift_id: Optional[int] = None
+    work_date: Optional[date] = None
+    target_date: Optional[date] = None
+    device_id: Optional[str] = None
+    start_latitude: Optional[float] = None
+    start_longitude: Optional[float] = None
+    start_accuracy_meters: Optional[float] = None
+
+
+class ResolveShiftSessionResponse(BaseModel):
+    success: bool
+    has_shift: bool = True
+    session_id: int
+    session_uuid: str
+    status: str
+    is_new: bool
+    shift_id: Optional[int] = None
+    shift_name: Optional[str] = None
+    shift_start_time: Optional[datetime] = None
+    shift_end_time: Optional[datetime] = None
+    total_distance_meters: float = 0.0
+    accepted_point_count: int = 0
+    tracking_completeness: str = "COMPLETE"
+    active_interruption: Optional[TrackingInterruptionEventItem] = None
+    message: str
+
+
+class TrackingHeartbeatRequest(BaseModel):
+    session_uuid: str
+    device_id: Optional[str] = None
+    battery_level: Optional[float] = None
+    is_charging: Optional[bool] = None
+    battery_optimization_ignored: Optional[bool] = None
+    location_services_enabled: Optional[bool] = None
+    gps_provider_enabled: Optional[bool] = None
+    network_provider_enabled: Optional[bool] = None
+    last_latitude: Optional[float] = None
+    last_longitude: Optional[float] = None
+    last_accuracy_meters: Optional[float] = None
+    last_fix_time: Optional[datetime] = None
+    timestamp: Optional[datetime] = None
+
+
+class TrackingHeartbeatResponse(BaseModel):
+    success: bool
+    server_time: datetime
+    session_status: str
+    should_stop: bool = False
+    message: str
+
+
+class RecordInterruptionRequest(BaseModel):
+    event_uuid: str
+    session_uuid: str
+    reason_code: str
+    description: str
+    severity: Optional[str] = "WARNING"
+    detected_at: datetime
+    last_known_latitude: Optional[float] = None
+    last_known_longitude: Optional[float] = None
+    last_known_location_time: Optional[datetime] = None
+    diagnostic_details: Optional[Union[str, Dict[str, Any]]] = None
+    is_confirmed: Optional[bool] = True
+    device_id: Optional[str] = None
+
+
+class RecordRecoveryRequest(BaseModel):
+    event_uuid: Optional[str] = None
+    session_uuid: str
+    reason_code: Optional[str] = None
+    recovered_at: datetime
+    recovery_outcome: Optional[str] = "RECOVERED"
+    recovery_latitude: Optional[float] = None
+    recovery_longitude: Optional[float] = None
+    diagnostic_details: Optional[Union[str, Dict[str, Any]]] = None
+
+
+class SyncOfflineEventsRequest(BaseModel):
+    session_uuid: str
+    events: List[RecordInterruptionRequest]
+
+
+class SyncOfflineEventsResponse(BaseModel):
+    success: bool
+    synced_count: int
+    synced_event_ids: List[str] = []
+    message: str
 
 
 class TrackingRouteResponse(BaseModel):

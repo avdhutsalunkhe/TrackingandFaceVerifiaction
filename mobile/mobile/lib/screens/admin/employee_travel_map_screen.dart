@@ -9,6 +9,7 @@ import '../../core/network/api_client.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/services/tracking_service.dart';
 import '../../core/services/tracking_database.dart';
+import '../../core/services/route_simplifier.dart';
 import 'employee_table_screen.dart';
 
 class EmployeeTravelMapScreen extends StatefulWidget {
@@ -48,6 +49,10 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   List<Map<String, dynamic>> _rawPoints = [];
   Map<String, dynamic>? _sessionDetail;
 
+  // Derived Simplified Route State for Clean Map Rendering
+  List<LatLng> _simplifiedRoutePoints = [];
+  List<int> _simplifiedRawIndices = [];
+
   bool _isLoading = false;
   bool _hasSearched = false;
   bool _showPoints = true;
@@ -55,6 +60,29 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   List<Map<String, dynamic>> _availableSessions = [];
   int? _selectedSessionId;
   String? _loadError;
+  List<Map<String, dynamic>> _interruptionEvents = [];
+  bool _isInterruptionHistoryExpanded = true;
+
+  /// Recalculates simplified polyline vertices using the hybrid route simplification pipeline
+  void _recalculateSimplifiedRoute() {
+    if (_rawPoints.isEmpty) {
+      _simplifiedRoutePoints = [];
+      _simplifiedRawIndices = [];
+      return;
+    }
+    const options = RouteSimplifierOptions(
+      baseEpsilonMeters: 0.8,
+      turnEpsilonMeters: 0.4,
+      straightEpsilonMeters: 1.2,
+      radialPreFilterMeters: 1.0,
+      minTurnAngleDegrees: 15.0,
+      maxAllowedDeviationMeters: 2.5,
+      preserveLoops: true,
+    );
+    final result = RouteSimplifier.simplifyRawMaps(_rawPoints, options);
+    _simplifiedRoutePoints = result.toLatLngList();
+    _simplifiedRawIndices = result.originalIndices;
+  }
 
   // Live Stream & Route Playback
   StreamSubscription<Map<String, dynamic>>? _livePointsSub;
@@ -102,6 +130,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
         setState(() {
           _rawPoints.add(pointData);
           _routePoints.add(newCoord);
+          _recalculateSimplifiedRoute();
           if (_sessionDetail != null) {
             _sessionDetail!['total_distance_meters'] = TrackingService.instance.totalDistanceMeters;
             _sessionDetail!['point_count'] = _rawPoints.length;
@@ -265,11 +294,28 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                 .map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble()))
                 .toList();
 
+            // Fetch Interruption Events for this shift session
+            List<Map<String, dynamic>> interruptions = [];
+            try {
+              final intRes = await _apiClient.get('/api/tracking/sessions/$sessionId/interruptions');
+              if (intRes is List) {
+                interruptions = intRes.map((e) => Map<String, dynamic>.from(e)).toList();
+              }
+            } catch (_) {
+              if (sessionUuid != null) {
+                try {
+                  interruptions = await TrackingDatabase.instance.getInterruptionHistory(sessionUuid);
+                } catch (_) {}
+              }
+            }
+
             setState(() {
               _isOfflineMode = false;
               _sessionDetail = Map<String, dynamic>.from(routeRes['session'] ?? session);
               _rawPoints = combinedPoints;
               _routePoints = latLngs;
+              _interruptionEvents = interruptions;
+              _recalculateSimplifiedRoute();
               _isLoading = false;
             });
 
@@ -292,6 +338,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       setState(() {
         _availableSessions = [];
         _selectedSessionId = null;
+        _interruptionEvents = [];
         _isLoading = false;
       });
     } catch (e) {
@@ -306,6 +353,11 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
               .map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble()))
               .toList();
 
+          List<Map<String, dynamic>> localInterruptions = [];
+          try {
+            localInterruptions = await TrackingDatabase.instance.getInterruptionHistory(sessionUuid);
+          } catch (_) {}
+
           if (mounted) {
             setState(() {
               _isOfflineMode = true;
@@ -314,6 +366,8 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
               _sessionDetail = Map<String, dynamic>.from(session);
               _rawPoints = localPoints;
               _routePoints = latLngs;
+              _interruptionEvents = localInterruptions;
+              _recalculateSimplifiedRoute();
               _isLoading = false;
               _loadError = null;
             });
@@ -405,9 +459,11 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     }
   }
 
-  /// Splits route into distinct polylines across gaps (>15 min delay or tracking pause)
+  /// Splits route into distinct polylines across gaps (>15 min delay or tracking pause),
+  /// rendering the hybrid simplified route for a clean, non-cluttered display.
   List<Polyline> _buildRoutePolylines() {
-    if (_routePoints.isEmpty) return [];
+    final pointsToRender = _simplifiedRoutePoints.isNotEmpty ? _simplifiedRoutePoints : _routePoints;
+    if (pointsToRender.isEmpty) return [];
 
     final List<Polyline> lines = [];
     List<LatLng> currentSegment = [];
@@ -428,16 +484,15 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       ));
     }
 
-    if (_rawPoints.isEmpty) {
-      addSegment(_routePoints);
+    if (_rawPoints.isEmpty || _simplifiedRawIndices.length != pointsToRender.length) {
+      addSegment(pointsToRender);
       return lines;
     }
 
-    for (int i = 0; i < _rawPoints.length; i++) {
-      final pt = _rawPoints[i];
-      final lat = (pt['latitude'] as num).toDouble();
-      final lng = (pt['longitude'] as num).toDouble();
-      final coord = LatLng(lat, lng);
+    for (int i = 0; i < pointsToRender.length; i++) {
+      final rawIdx = _simplifiedRawIndices[i];
+      final pt = _rawPoints[rawIdx];
+      final coord = pointsToRender[i];
       final isGap = pt['is_gap'] == 1 || pt['is_gap'] == true;
 
       if (isGap && currentSegment.isNotEmpty) {
@@ -675,8 +730,8 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                           _buildConfigurationCard(),
                           const SizedBox(height: 20),
 
-                          // C. Travel Summary Cards
-                          _buildTravelSummarySection(),
+                          // C. Unified Primary Shift Tracking Card (with collapsible Interruption History)
+                          _buildShiftTrackingCard(),
                           const SizedBox(height: 20),
 
                           // D. Recorded Travel Route Map Card
@@ -800,13 +855,15 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                   isExpanded: true,
                   value: _selectedSessionId,
                   items: _availableSessions.map((s) {
-                    final sTime = _formatTime(s['start_time']);
+                    final shiftStart = _formatTime(s['shift_start_time'] ?? s['start_time']);
+                    final shiftEnd = _formatTime(s['shift_end_time'] ?? s['end_time']);
                     final sStatus = (s['status'] ?? 'COMPLETED').toString().toUpperCase();
                     final sDist = ((s['total_distance_meters'] ?? 0) / 1000.0).toStringAsFixed(2);
+                    final shiftLabel = s['shift_id'] != null ? 'Assigned Shift #${s['shift_id']}' : 'Assigned Shift';
                     return DropdownMenuItem<int>(
                       value: s['id'] as int,
                       child: Text(
-                        'Session #${s['id']} ($sTime) • $sStatus • $sDist km',
+                        '$shiftLabel ($shiftStart – $shiftEnd) • $sStatus • $sDist km',
                         style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF0F172A)),
                       ),
                     );
@@ -885,8 +942,8 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     );
   }
 
-  // C. Travel Summary Section
-  Widget _buildTravelSummarySection() {
+  // C. Primary Shift Tracking Card
+  Widget _buildShiftTrackingCard() {
     // 1. Calculate actual consecutive geodesic distance from raw points
     double distMeters = 0.0;
     if (_rawPoints.length > 1) {
@@ -912,15 +969,29 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     final status = (_sessionDetail?['status'] ?? 'COMPLETED').toString().toUpperCase();
     final isCompleted = status == 'COMPLETED';
     final isActive = status == 'ACTIVE' || status == 'RECORDING';
+    final isDegraded = status == 'DEGRADED';
+    final isRecovering = status == 'RECOVERING';
+    final isInterrupted = status == 'INTERRUPTED' || _interruptionEvents.any((e) => e['recovery_outcome'] == 'UNRESOLVED');
 
-    // 2. Start Time and End Time directly from earliest and latest chronological points
-    dynamic startIso = _rawPoints.isNotEmpty ? _rawPoints.first['recorded_at'] : _sessionDetail?['start_time'];
-    dynamic endIso = _rawPoints.isNotEmpty ? _rawPoints.last['recorded_at'] : _sessionDetail?['end_time'];
+    // Start Time and End Time directly from earliest and latest chronological points or session fields
+    dynamic startIso = _sessionDetail?['actual_start_time'] ?? (_rawPoints.isNotEmpty ? _rawPoints.first['recorded_at'] : _sessionDetail?['start_time']);
+    dynamic endIso = _sessionDetail?['actual_stop_time'] ?? (_rawPoints.isNotEmpty ? _rawPoints.last['recorded_at'] : _sessionDetail?['end_time']);
 
     final startTimeStr = _formatTime(startIso);
     final endTimeStr = _formatTime(endIso);
 
-    // 3. Derive Tracking Date from earliest point if available
+    final scheduledStartStr = _formatTime(_sessionDetail?['shift_start_time'] ?? '08:30:00');
+    final scheduledEndStr = _formatTime(_sessionDetail?['shift_end_time'] ?? '18:00:00');
+
+    final lastFixIso = _rawPoints.isNotEmpty ? _rawPoints.last['recorded_at'] : _sessionDetail?['last_point_time'];
+    final lastFixTimeStr = _formatTime(lastFixIso);
+
+    final lastSyncIso = _sessionDetail?['last_heartbeat_time'] ?? TrackingService.instance.lastSyncTime?.toIso8601String();
+    final lastSyncTimeStr = _formatTime(lastSyncIso);
+
+    final completeness = (_sessionDetail?['tracking_completeness'] ?? 'COMPLETE').toString().toUpperCase();
+
+    // Derived Display Date
     DateTime displayDate = _selectedDate;
     if (_rawPoints.isNotEmpty && _rawPoints.first['recorded_at'] != null) {
       try {
@@ -931,13 +1002,37 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
         displayDate = rawUtc.add(const Duration(hours: 5, minutes: 30));
       } catch (_) {}
     }
-
     final formattedDate = DateFormat('dd MMM yyyy').format(displayDate);
-    final dayOfWeek = DateFormat('EEEE').format(displayDate);
+
+    // Status chip colors and text
+    String statusLabel = 'Completed';
+    Color statusBg = const Color(0xFFDEF7EC);
+    Color statusTextColor = const Color(0xFF047857);
+
+    if (isInterrupted) {
+      statusLabel = 'Temporarily Interrupted';
+      statusBg = const Color(0xFFFEF3C7);
+      statusTextColor = const Color(0xFFB45309);
+    } else if (isDegraded) {
+      statusLabel = 'Degraded (Poor GPS)';
+      statusBg = const Color(0xFFFEF3C7);
+      statusTextColor = const Color(0xFFB45309);
+    } else if (isRecovering) {
+      statusLabel = 'Recovering';
+      statusBg = const Color(0xFFDBEAFE);
+      statusTextColor = const Color(0xFF1E40AF);
+    } else if (isActive) {
+      statusLabel = 'Active';
+      statusBg = const Color(0xFFDCFCE7);
+      statusTextColor = const Color(0xFF15803D);
+    } else if (status == 'SCHEDULED') {
+      statusLabel = 'Scheduled';
+      statusBg = const Color(0xFFF3E8FF);
+      statusTextColor = const Color(0xFF7E22CE);
+    }
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(16),
@@ -953,96 +1048,569 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: const [
-              Icon(Icons.bar_chart_rounded, color: Color(0xFF203F92), size: 22),
-              SizedBox(width: 8),
-              Text(
-                'Travel Summary',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                  color: Color(0xFF0F172A),
+          // 1. Primary Card Header
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEFF6FF),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.badge_rounded, color: Color(0xFF203F92), size: 26),
                 ),
-              ),
-            ],
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE0E7FF),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Text(
+                              'Travel Summary',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF3730A3),
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Employee $_employeeCode — Shift Tracking',
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFF0F172A),
+                          letterSpacing: -0.3,
+                        ),
+                      ),
+                      Wrap(
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Text(
+                            _employeeName,
+                            style: const TextStyle(fontSize: 13, color: Color(0xFF334155), fontWeight: FontWeight.w600),
+                          ),
+                          const Text(' • ', style: TextStyle(color: Color(0xFF94A3B8))),
+                          Text(
+                            'ID: $_employeeCode',
+                            style: const TextStyle(fontSize: 13, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+                          ),
+                          const Text(' • ', style: TextStyle(color: Color(0xFF94A3B8))),
+                          Text(
+                            formattedDate,
+                            style: const TextStyle(fontSize: 13, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: statusBg,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    statusLabel,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: statusTextColor,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 16),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              return Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                children: [
-                  // 1. Employee
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFEFF6FF),
-                    iconColor: const Color(0xFF2563EB),
-                    icon: Icons.person_rounded,
-                    label: 'Employee',
-                    value: _employeeName,
-                    subValue: 'ID: $_employeeCode',
-                    minWidth: 150,
-                  ),
-                  // 2. Date
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFEFF6FF),
-                    iconColor: const Color(0xFF2563EB),
-                    icon: Icons.calendar_today_rounded,
-                    label: 'Date',
-                    value: formattedDate,
-                    subValue: dayOfWeek,
-                    minWidth: 140,
-                  ),
-                  // 3. Tracking Status
-                  _buildStatusMetricCard(
-                    status: isCompleted ? 'Completed' : (isActive ? 'Active' : 'Pending'),
-                    isCompleted: isCompleted,
-                    isActive: isActive,
-                  ),
-                  // 4. Start Time
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFEFF6FF),
-                    iconColor: const Color(0xFF2563EB),
-                    icon: Icons.access_time_rounded,
-                    label: 'Start Time',
-                    value: startTimeStr,
-                    minWidth: 130,
-                  ),
-                  // 5. End Time
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFFFF7ED),
-                    iconColor: const Color(0xFFF97316),
-                    icon: Icons.access_time_rounded,
-                    label: 'End Time',
-                    value: endTimeStr,
-                    minWidth: 130,
-                  ),
-                  // 6. Travel Distance
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFFAF5FF),
-                    iconColor: const Color(0xFF9333EA),
-                    icon: Icons.alt_route_rounded,
-                    label: 'Travel Distance',
-                    value: '$distanceKm km',
-                    minWidth: 140,
-                  ),
-                  // 7. Total Points
-                  _buildMetricCard(
-                    iconBg: const Color(0xFFFDF2F8),
-                    iconColor: const Color(0xFFDB2777),
-                    icon: Icons.location_on_rounded,
-                    label: 'Total Points',
-                    value: '$totalPoints',
-                    minWidth: 120,
-                  ),
-                ],
-              );
-            },
+
+          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+
+          // 2. Metrics Grid
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    // Tracking Status
+                    _buildMetricCard(
+                      iconBg: statusBg,
+                      iconColor: statusTextColor,
+                      icon: Icons.info_outline_rounded,
+                      label: 'Tracking Status',
+                      value: statusLabel,
+                      subValue: 'Continuous Shift Mode',
+                      minWidth: 150,
+                    ),
+                    // Scheduled Shift Window
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFEFF6FF),
+                      iconColor: const Color(0xFF2563EB),
+                      icon: Icons.calendar_month_rounded,
+                      label: 'Scheduled',
+                      value: '$scheduledStartStr – $scheduledEndStr',
+                      subValue: 'Assigned Shift',
+                      minWidth: 160,
+                    ),
+                    // Actual Tracking Start
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFF0FDF4),
+                      iconColor: const Color(0xFF16A34A),
+                      icon: Icons.play_circle_filled_rounded,
+                      label: 'Start Time',
+                      value: startTimeStr,
+                      subValue: 'Actual Start',
+                      minWidth: 140,
+                    ),
+                    // Actual / Scheduled End Time
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFFFF7ED),
+                      iconColor: const Color(0xFFEA580C),
+                      icon: Icons.stop_circle_rounded,
+                      label: 'End Time',
+                      value: endTimeStr.isNotEmpty ? endTimeStr : scheduledEndStr,
+                      subValue: isCompleted ? 'Shift Concluded' : 'Scheduled End',
+                      minWidth: 140,
+                    ),
+                    // Total Accepted Distance
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFFAF5FF),
+                      iconColor: const Color(0xFF9333EA),
+                      icon: Icons.alt_route_rounded,
+                      label: 'Travel Distance',
+                      value: '$distanceKm km',
+                      subValue: 'Accepted Route Distance',
+                      minWidth: 140,
+                    ),
+                    // Accepted GPS Points
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFFDF2F8),
+                      iconColor: const Color(0xFFDB2777),
+                      icon: Icons.location_on_rounded,
+                      label: 'Total Points',
+                      value: '$totalPoints',
+                      subValue: 'Accepted Coordinates',
+                      minWidth: 130,
+                    ),
+                    // Last Successful GPS Fix
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFF0FDF4),
+                      iconColor: const Color(0xFF16A34A),
+                      icon: Icons.gps_fixed_rounded,
+                      label: 'Last GPS Fix',
+                      value: lastFixTimeStr,
+                      subValue: 'Satellite Quality OK',
+                      minWidth: 140,
+                    ),
+                    // Last Server Sync
+                    _buildMetricCard(
+                      iconBg: const Color(0xFFEFF6FF),
+                      iconColor: const Color(0xFF2563EB),
+                      icon: Icons.cloud_done_rounded,
+                      label: 'Last Server Sync',
+                      value: lastSyncTimeStr,
+                      subValue: 'Heartbeat / Cloud Upload',
+                      minWidth: 140,
+                    ),
+                    // Tracking Completeness
+                    _buildCompletenessMetricCard(completeness: completeness),
+                  ],
+                );
+              },
+            ),
+          ),
+
+          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+
+          // 3. Collapsible Interruption History Timeline
+          _buildInterruptionHistoryCollapsible(
+            startTimeStr: startTimeStr,
+            endTimeStr: endTimeStr,
+            isCompleted: isCompleted,
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildCompletenessMetricCard({required String completeness}) {
+    Color bg = const Color(0xFFDEF7EC);
+    Color textColor = const Color(0xFF047857);
+    String label = 'Complete';
+
+    if (completeness == 'HAS_GAPS') {
+      bg = const Color(0xFFFEF3C7);
+      textColor = const Color(0xFFB45309);
+      label = 'Has Gaps';
+    } else if (completeness == 'PENDING_SYNC') {
+      bg = const Color(0xFFDBEAFE);
+      textColor = const Color(0xFF1E40AF);
+      label = 'Pending Sync';
+    } else if (completeness == 'INCOMPLETE') {
+      bg = const Color(0xFFFEE2E2);
+      textColor = const Color(0xFFB91C1C);
+      label = 'Incomplete';
+    }
+
+    return Container(
+      constraints: const BoxConstraints(minWidth: 150),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: bg,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(Icons.verified_user_rounded, color: textColor, size: 20),
+          ),
+          const SizedBox(width: 10),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Completeness',
+                style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: textColor),
+              ),
+              const SizedBox(height: 1),
+              Text(
+                completeness == 'COMPLETE' ? 'No Missing Spans' : 'Audit Gaps Detected',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInterruptionHistoryCollapsible({
+    required String startTimeStr,
+    required String endTimeStr,
+    required bool isCompleted,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: () {
+            setState(() {
+              _isInterruptionHistoryExpanded = !_isInterruptionHistoryExpanded;
+            });
+          },
+          borderRadius: const BorderRadius.vertical(bottom: Radius.circular(16)),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            child: Row(
+              children: [
+                Icon(
+                  _interruptionEvents.isEmpty ? Icons.check_circle_outline_rounded : Icons.history_rounded,
+                  size: 20,
+                  color: _interruptionEvents.isEmpty ? const Color(0xFF16A34A) : const Color(0xFFD97706),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  'Interruption History (${_interruptionEvents.length} events)',
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF0F172A),
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  _isInterruptionHistoryExpanded ? 'Collapse' : 'Expand',
+                  style: const TextStyle(fontSize: 13, color: Color(0xFF2563EB), fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(width: 4),
+                Icon(
+                  _isInterruptionHistoryExpanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
+                  color: const Color(0xFF2563EB),
+                  size: 20,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_isInterruptionHistoryExpanded) ...[
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+            child: _interruptionEvents.isEmpty
+                ? Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF0FDF4),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFFBBF7D0)),
+                    ),
+                    child: Row(
+                      children: const [
+                        Icon(Icons.check_circle_rounded, color: Color(0xFF16A34A), size: 20),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'No tracking interruptions detected. 100% continuous GPS tracking maintained throughout this shift.',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Color(0xFF15803D),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Timeline start node
+                      _buildTimelineItem(
+                        timeStr: startTimeStr,
+                        title: 'Shift tracking started automatically',
+                        description: 'Assigned shift schedule triggered automatic continuous tracking session.',
+                        color: const Color(0xFF16A34A),
+                        icon: Icons.play_arrow_rounded,
+                        isFirst: true,
+                        isLast: false,
+                      ),
+                      // Dynamic interruption events
+                      ..._interruptionEvents.map((e) {
+                        final detTime = _formatTime(e['detected_at']);
+                        final recTime = e['recovered_at'] != null ? _formatTime(e['recovered_at']) : null;
+                        final reasonCode = e['reason_code'] as String?;
+                        final title = _formatReasonCode(reasonCode);
+                        final desc = e['description'] as String? ?? 'Tracking condition detected.';
+                        final durSec = (e['duration_seconds'] as num?)?.toInt() ?? 0;
+                        final outcome = e['recovery_outcome'] as String? ?? 'UNRESOLVED';
+                        final isResolved = outcome == 'RESOLVED' || outcome == 'RECOVERED';
+                        final isConfirmed = (e['is_confirmed'] ?? 1) == 1;
+
+                        Color nodeColor = const Color(0xFFDC2626);
+                        if (reasonCode == 'POOR_ACCURACY' || reasonCode == 'GPS_GLITCH_UNSTABLE') {
+                          nodeColor = const Color(0xFFD97706);
+                        } else if (reasonCode == 'INTERNET_DISCONNECTED') {
+                          nodeColor = const Color(0xFF2563EB);
+                        }
+
+                        String detailsText = desc;
+                        if (isResolved && recTime != null) {
+                          final minStr = (durSec / 60.0).toStringAsFixed(1);
+                          detailsText += '\n• Recovered at $recTime ($durSec s / $minStr min outage) • Outcome: $outcome';
+                        } else {
+                          detailsText += '\n• Unresolved outage / Recovery pending';
+                        }
+                        if (!isConfirmed) {
+                          detailsText += ' [Inferred from heartbeat loss]';
+                        }
+
+                        return _buildTimelineItem(
+                          timeStr: detTime,
+                          title: title,
+                          description: detailsText,
+                          color: nodeColor,
+                          icon: isResolved ? Icons.info_outline_rounded : Icons.warning_amber_rounded,
+                          isFirst: false,
+                          isLast: false,
+                          badge: isResolved ? 'Resolved' : 'Active Gap',
+                          badgeBg: isResolved ? const Color(0xFFDCFCE7) : const Color(0xFFFEE2E2),
+                          badgeColor: isResolved ? const Color(0xFF15803D) : const Color(0xFFB91C1C),
+                        );
+                      }).toList(),
+                      // Timeline end node
+                      if (isCompleted)
+                        _buildTimelineItem(
+                          timeStr: endTimeStr,
+                          title: 'Shift tracking concluded normally',
+                          description: 'Assigned shift ended. Final GPS coordinates, distance, and completeness persisted.',
+                          color: const Color(0xFF2563EB),
+                          icon: Icons.flag_rounded,
+                          isFirst: false,
+                          isLast: true,
+                        ),
+                    ],
+                  ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildTimelineItem({
+    required String timeStr,
+    required String title,
+    required String description,
+    required Color color,
+    required IconData icon,
+    required bool isFirst,
+    required bool isLast,
+    String? badge,
+    Color? badgeBg,
+    Color? badgeColor,
+  }) {
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Time column
+          SizedBox(
+            width: 70,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                timeStr,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF475569),
+                ),
+              ),
+            ),
+          ),
+          // Vertical indicator line & node
+          Column(
+            children: [
+              Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.12),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: color, width: 2),
+                ),
+                child: Icon(icon, size: 12, color: color),
+              ),
+              if (!isLast)
+                Expanded(
+                  child: Container(
+                    width: 2,
+                    color: const Color(0xFFE2E8F0),
+                    margin: const EdgeInsets.symmetric(vertical: 4),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(width: 12),
+          // Content Card
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFE2E8F0)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF0F172A),
+                            ),
+                          ),
+                        ),
+                        if (badge != null && badgeBg != null && badgeColor != null)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: badgeBg,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              badge,
+                              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: badgeColor),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      description,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF475569),
+                        height: 1.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatReasonCode(String? code) {
+    if (code == null) return 'Tracking Interrupted';
+    switch (code) {
+      case 'LOCATION_SERVICES_DISABLED':
+        return 'GPS Location Services Disabled';
+      case 'GPS_FIX_UNAVAILABLE':
+        return 'GPS Fix Unavailable / Timeout';
+      case 'GNSS_ACQUISITION_FAILURE':
+        return 'GNSS Satellite Acquisition Failure';
+      case 'POOR_ACCURACY':
+        return 'Poor GPS Accuracy / Coordinate Jitter';
+      case 'GPS_GLITCH_UNSTABLE':
+        return 'Implausible GPS Jump / Teleportation';
+      case 'LOCATION_PERMISSION_REVOKED':
+        return 'Location Permission Revoked';
+      case 'BACKGROUND_LOCATION_PERMISSION_MISSING':
+        return 'Background Location Permission Missing';
+      case 'INTERNET_DISCONNECTED':
+        return 'Internet Disconnected (Offline GPS Queue)';
+      case 'BACKGROUND_SERVICE_STOPPED':
+        return 'Background Service Terminated by OS';
+      case 'TRACKING_HEARTBEAT_LOST':
+        return 'Tracking Heartbeat Lost';
+      case 'SHIFT_CONCLUDED':
+        return 'Shift Concluded Normally';
+      default:
+        return code.replaceAll('_', ' ');
+    }
   }
 
   Widget _buildMetricCard({
@@ -1102,79 +1670,6 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
     );
   }
 
-  Widget _buildStatusMetricCard({
-    required String status,
-    required bool isCompleted,
-    required bool isActive,
-  }) {
-    final pillBg = isCompleted
-        ? const Color(0xFFDEF7EC)
-        : (isActive ? const Color(0xFFDBEAFE) : const Color(0xFFF1F5F9));
-    final pillColor = isCompleted
-        ? const Color(0xFF047857)
-        : (isActive ? const Color(0xFF1E40AF) : const Color(0xFF475569));
-
-    return Container(
-      constraints: const BoxConstraints(minWidth: 150),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: isCompleted ? const Color(0xFFECFDF5) : const Color(0xFFEFF6FF),
-              shape: BoxShape.circle,
-            ),
-            child: Center(
-              child: Container(
-                width: 12,
-                height: 12,
-                decoration: BoxDecoration(
-                  color: isCompleted ? const Color(0xFF10B981) : const Color(0xFF3B82F6),
-                  shape: BoxShape.circle,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'Tracking Status',
-                style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
-              ),
-              const SizedBox(height: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: pillBg,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  status,
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                    color: pillColor,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
   // D. Recorded Travel Route Map Card
   Widget _buildRecordedMapCard() {
     final initialCenter = _routePoints.isNotEmpty
@@ -1204,7 +1699,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
           // Header & Toolbar (Responsive)
           LayoutBuilder(
             builder: (context, constraints) {
-              final isCompact = constraints.maxWidth < 640;
+              final isCompact = constraints.maxWidth < 990;
               final toolbarButtons = [
                 OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
@@ -1298,7 +1793,12 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                     ),
                   ),
                   const Spacer(),
-                  ...toolbarButtons,
+                  Flexible(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(children: toolbarButtons),
+                    ),
+                  ),
                 ],
               );
             },
@@ -1444,13 +1944,13 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                       PolylineLayer(
                         polylines: _buildRoutePolylines(),
                       ),
-                    // Checkpoint dots with click-to-inspect
-                    if (_showPoints && _routePoints.length > 2)
+                    // Checkpoint dots with click-to-inspect (rendered cleanly from simplified anchors)
+                    if (_showPoints && _simplifiedRoutePoints.length > 2)
                       CircleLayer(
-                        circles: List.generate(_routePoints.length, (idx) {
-                          if (idx == 0 || idx == _routePoints.length - 1) return null;
+                        circles: List.generate(_simplifiedRoutePoints.length, (idx) {
+                          if (idx == 0 || idx == _simplifiedRoutePoints.length - 1) return null;
                           return CircleMarker(
-                            point: _routePoints[idx],
+                            point: _simplifiedRoutePoints[idx],
                             radius: 4.0,
                             color: const Color(0xFF2563EB),
                             borderColor: Colors.white,
@@ -1472,18 +1972,19 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
 
                           return MarkerLayer(
                             markers: [
-                              // 0. Individual clickable Checkpoint Dots when Show Points is active
-                              if (_showPoints && _routePoints.length > 2)
-                                ...List.generate(_routePoints.length - 2, (i) {
-                                  final ptIdx = i + 1;
+                              // 0. Individual clickable Checkpoint Dots when Show Points is active (anchors only)
+                              if (_showPoints && _simplifiedRoutePoints.length > 2)
+                                ...List.generate(_simplifiedRoutePoints.length - 2, (i) {
+                                  final sIdx = i + 1;
+                                  final rawIdx = _simplifiedRawIndices.length > sIdx ? _simplifiedRawIndices[sIdx] : sIdx;
                                   return Marker(
-                                    point: _routePoints[ptIdx],
+                                    point: _simplifiedRoutePoints[sIdx],
                                     width: 22,
                                     height: 22,
                                     child: GestureDetector(
-                                      onTap: () => _showPointDetails(ptIdx),
+                                      onTap: () => _showPointDetails(rawIdx),
                                       child: Tooltip(
-                                        message: 'Point #${ptIdx + 1}: ${_formatTime(_rawPoints.isNotEmpty ? _rawPoints[ptIdx]['recorded_at'] : null)}',
+                                        message: 'Point #${_rawPoints.isNotEmpty ? (_rawPoints[rawIdx]['sequence_number'] ?? (rawIdx + 1)) : (rawIdx + 1)}: ${_formatTime(_rawPoints.isNotEmpty ? _rawPoints[rawIdx]['recorded_at'] : null)}',
                                         child: Container(
                                           decoration: BoxDecoration(
                                             color: const Color(0xFF2563EB),

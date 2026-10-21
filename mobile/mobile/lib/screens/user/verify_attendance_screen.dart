@@ -141,8 +141,8 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
       _promptInstruction = "Position your face inside the frame.";
     });
 
-    // Stabilization delay so employee can position their face
-    await Future.delayed(const Duration(milliseconds: 1000));
+    // Fast stabilization delay for front camera auto-exposure and face positioning
+    await Future.delayed(const Duration(milliseconds: 350));
     if (!mounted || !_isAutoLoopActive) return;
 
     setState(() {
@@ -150,7 +150,7 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
       _promptInstruction = "Hold still...";
     });
 
-    await Future.delayed(const Duration(milliseconds: 400));
+    await Future.delayed(const Duration(milliseconds: 200));
     if (!mounted || !_isAutoLoopActive) return;
 
     _captureAndSubmit();

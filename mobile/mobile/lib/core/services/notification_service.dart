@@ -37,7 +37,7 @@ class NotificationService {
       debugPrint('[NotificationService] Timezone init fallback: $e');
     }
 
-    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const androidSettings = AndroidInitializationSettings('@drawable/ic_stat_fieldtrack');
     const initSettings = InitializationSettings(android: androidSettings);
 
     await _notificationsPlugin.initialize(
@@ -93,7 +93,7 @@ class NotificationService {
         channelDescription: channelDesc,
         importance: Importance.high,
         priority: Priority.high,
-        icon: '@mipmap/ic_launcher',
+        icon: '@drawable/ic_stat_fieldtrack',
         showWhen: true,
       );
 

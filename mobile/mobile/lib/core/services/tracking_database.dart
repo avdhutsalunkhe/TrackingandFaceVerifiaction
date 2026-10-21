@@ -15,11 +15,13 @@ class TrackingDatabase {
   final List<Map<String, dynamic>> _webOfflineSessions = [];
   final List<Map<String, dynamic>> _webOfflinePoints = [];
   final List<Map<String, dynamic>> _webOfflineChunks = [];
+  final List<Map<String, dynamic>> _webOfflineInterruptionEvents = [];
   final List<Map<String, dynamic>> _webNotifications = [];
   int _webSessionSeq = 1;
   int _webNotifSeq = 1;
   int _webPointSeq = 1;
   int _webChunkSeq = 1;
+  int _webEventSeq = 1;
 
   bool isTestMode = false;
   bool get _useMemoryFallback => kIsWeb || isTestMode;
@@ -37,7 +39,7 @@ class TrackingDatabase {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: (db, version) async {
         // Table for tracking sessions created offline (1 summary row per session)
         await db.execute("""
@@ -119,6 +121,31 @@ class TrackingDatabase {
             is_read INTEGER NOT NULL DEFAULT 0
           )
         """);
+
+        // Table for durable tracking interruption events
+        await db.execute("""
+          CREATE TABLE offline_interruption_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_uuid TEXT NOT NULL UNIQUE,
+            session_uuid TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            device_id TEXT,
+            reason_code TEXT NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'WARNING',
+            detected_at TEXT NOT NULL,
+            recovered_at TEXT,
+            duration_seconds INTEGER,
+            last_known_latitude REAL,
+            last_known_longitude REAL,
+            last_known_location_time TEXT,
+            diagnostic_details TEXT,
+            is_confirmed INTEGER NOT NULL DEFAULT 1,
+            recovery_outcome TEXT NOT NULL DEFAULT 'UNRESOLVED',
+            sync_status TEXT NOT NULL DEFAULT 'PENDING'
+          )
+        """);
+        await db.execute('CREATE INDEX idx_offline_events_session ON offline_interruption_events (session_uuid, detected_at)');
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -183,6 +210,33 @@ class TrackingDatabase {
             await db.execute("ALTER TABLE offline_sessions ADD COLUMN last_accepted_longitude REAL");
             await db.execute("ALTER TABLE offline_sessions ADD COLUMN last_accepted_time TEXT");
           } catch (_) {}
+        }
+
+        if (oldVersion < 4) {
+          // Version 4: Durable Interruption Events Table
+          await db.execute("""
+            CREATE TABLE IF NOT EXISTS offline_interruption_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_uuid TEXT NOT NULL UNIQUE,
+              session_uuid TEXT NOT NULL,
+              user_id INTEGER NOT NULL,
+              device_id TEXT,
+              reason_code TEXT NOT NULL,
+              description TEXT NOT NULL,
+              severity TEXT NOT NULL DEFAULT 'WARNING',
+              detected_at TEXT NOT NULL,
+              recovered_at TEXT,
+              duration_seconds INTEGER,
+              last_known_latitude REAL,
+              last_known_longitude REAL,
+              last_known_location_time TEXT,
+              diagnostic_details TEXT,
+              is_confirmed INTEGER NOT NULL DEFAULT 1,
+              recovery_outcome TEXT NOT NULL DEFAULT 'UNRESOLVED',
+              sync_status TEXT NOT NULL DEFAULT 'PENDING'
+            )
+          """);
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_events_session ON offline_interruption_events (session_uuid, detected_at)');
         }
       },
     );
@@ -847,5 +901,215 @@ class TrackingDatabase {
     if (db == null) return 0;
     final res = await db.rawQuery('SELECT COUNT(*) as cnt FROM in_app_notifications WHERE is_read = 0');
     return Sqflite.firstIntValue(res) ?? 0;
+  }
+
+  // --- Offline Interruption Event Operations ---
+
+  Future<void> recordInterruptionEvent({
+    required String eventUuid,
+    required String sessionUuid,
+    required int userId,
+    String? deviceId,
+    required String reasonCode,
+    required String description,
+    required DateTime detectedAt,
+    DateTime? lastKnownFixAt,
+    String severity = 'WARNING',
+    Map<String, dynamic>? diagnostics,
+    bool isConfirmed = true,
+  }) async {
+    final row = <String, dynamic>{
+      'event_uuid': eventUuid,
+      'session_uuid': sessionUuid,
+      'user_id': userId,
+      if (deviceId != null) 'device_id': deviceId,
+      'reason_code': reasonCode,
+      'description': description,
+      'severity': severity,
+      'detected_at': detectedAt.toIso8601String(),
+      if (lastKnownFixAt != null) 'last_known_location_time': lastKnownFixAt.toIso8601String(),
+      if (diagnostics != null) 'diagnostic_details': jsonEncode(diagnostics),
+      'is_confirmed': isConfirmed ? 1 : 0,
+      'recovery_outcome': 'UNRESOLVED',
+      'sync_status': 'PENDING',
+    };
+
+    if (_useMemoryFallback) {
+      final existingIndex = _webOfflineInterruptionEvents.indexWhere((e) => e['event_uuid'] == eventUuid);
+      final ev = Map<String, dynamic>.from(row);
+      if (existingIndex >= 0) {
+        _webOfflineInterruptionEvents[existingIndex] = ev;
+      } else {
+        ev['id'] = _webEventSeq++;
+        _webOfflineInterruptionEvents.add(ev);
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    await db.insert(
+      'offline_interruption_events',
+      row,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<String?> closeInterruptionEvent({
+    required String sessionUuid,
+    String? eventUuid,
+    String? reasonCode,
+    required DateTime recoveredAt,
+    int? durationSeconds,
+    String outcome = 'RESOLVED',
+  }) async {
+    final recIso = recoveredAt.toIso8601String();
+    String? closedUuid = eventUuid;
+
+    if (_useMemoryFallback) {
+      for (final e in _webOfflineInterruptionEvents) {
+        if (e['session_uuid'] == sessionUuid && e['recovery_outcome'] == 'UNRESOLVED') {
+          if (eventUuid == null || e['event_uuid'] == eventUuid) {
+            closedUuid = e['event_uuid'] as String;
+            final detAtStr = e['detected_at'] as String?;
+            int dur = durationSeconds ?? 0;
+            if (durationSeconds == null && detAtStr != null) {
+              try {
+                dur = recoveredAt.difference(DateTime.parse(detAtStr)).inSeconds.abs();
+              } catch (_) {}
+            }
+            e['recovered_at'] = recIso;
+            e['duration_seconds'] = dur;
+            e['recovery_outcome'] = outcome;
+            e['sync_status'] = 'PENDING';
+            break;
+          }
+        }
+      }
+      return closedUuid;
+    }
+
+    final db = await database;
+    if (db == null) return null;
+
+    // Find target event to close and calculate duration if needed
+    String findWhere = 'session_uuid = ? AND recovery_outcome = ?';
+    List<dynamic> findArgs = [sessionUuid, 'UNRESOLVED'];
+    if (eventUuid != null) {
+      findWhere += ' AND event_uuid = ?';
+      findArgs.add(eventUuid);
+    } else if (reasonCode != null) {
+      findWhere += ' AND reason_code = ?';
+      findArgs.add(reasonCode);
+    }
+
+    final existing = await db.query(
+      'offline_interruption_events',
+      where: findWhere,
+      whereArgs: findArgs,
+      orderBy: 'detected_at DESC',
+      limit: 1,
+    );
+
+    if (existing.isNotEmpty) {
+      closedUuid = existing.first['event_uuid'] as String;
+      int dur = durationSeconds ?? 0;
+      if (durationSeconds == null) {
+        final detAtStr = existing.first['detected_at'] as String?;
+        if (detAtStr != null) {
+          try {
+            dur = recoveredAt.difference(DateTime.parse(detAtStr)).inSeconds.abs();
+          } catch (_) {}
+        }
+      }
+
+      await db.update(
+        'offline_interruption_events',
+        {
+          'recovered_at': recIso,
+          'duration_seconds': dur,
+          'recovery_outcome': outcome,
+          'sync_status': 'PENDING',
+        },
+        where: 'event_uuid = ?',
+        whereArgs: [closedUuid],
+      );
+    }
+
+    return closedUuid;
+  }
+
+  Future<List<Map<String, dynamic>>> getPendingInterruptionEvents() async {
+    if (_useMemoryFallback) {
+      return List<Map<String, dynamic>>.from(
+        _webOfflineInterruptionEvents.where((e) => e['sync_status'] == 'PENDING'),
+      );
+    }
+    final db = await database;
+    if (db == null) return [];
+    return await db.query(
+      'offline_interruption_events',
+      where: 'sync_status = ?',
+      whereArgs: ['PENDING'],
+      orderBy: 'detected_at ASC',
+    );
+  }
+
+  Future<void> markInterruptionEventsSynced(List<String> eventUuids) async {
+    if (eventUuids.isEmpty) return;
+    if (_useMemoryFallback) {
+      for (final e in _webOfflineInterruptionEvents) {
+        if (eventUuids.contains(e['event_uuid'])) {
+          e['sync_status'] = 'SYNCED';
+        }
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    final placeholders = List.filled(eventUuids.length, '?').join(',');
+    await db.update(
+      'offline_interruption_events',
+      {'sync_status': 'SYNCED'},
+      where: 'event_uuid IN ($placeholders)',
+      whereArgs: eventUuids,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getInterruptionHistory(String sessionUuid) async {
+    if (_useMemoryFallback) {
+      final list = _webOfflineInterruptionEvents
+          .where((e) => e['session_uuid'] == sessionUuid)
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      list.sort((a, b) => (a['detected_at'] as String).compareTo(b['detected_at'] as String));
+      return list;
+    }
+    final db = await database;
+    if (db == null) return [];
+    return await db.query(
+      'offline_interruption_events',
+      where: 'session_uuid = ?',
+      whereArgs: [sessionUuid],
+      orderBy: 'detected_at ASC',
+    );
+  }
+
+  Future<Map<String, dynamic>?> getActiveInterruption(String sessionUuid) async {
+    if (_useMemoryFallback) {
+      final matches = _webOfflineInterruptionEvents
+          .where((e) => e['session_uuid'] == sessionUuid && e['recovery_outcome'] == 'UNRESOLVED')
+          .toList();
+      return matches.isNotEmpty ? Map<String, dynamic>.from(matches.last) : null;
+    }
+    final db = await database;
+    if (db == null) return null;
+    final res = await db.query(
+      'offline_interruption_events',
+      where: 'session_uuid = ? AND recovery_outcome = ?',
+      whereArgs: [sessionUuid, 'UNRESOLVED'],
+      orderBy: 'detected_at DESC',
+      limit: 1,
+    );
+    return res.isNotEmpty ? res.first : null;
   }
 }

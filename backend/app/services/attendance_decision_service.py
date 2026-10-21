@@ -18,7 +18,9 @@ from app.models.attendance import (
 from app.schemas.attendance import AttendanceVerifyResponse
 from app.services.geofence_service import validate_geofence
 from app.services.audit_service import log_audit_event
+from app.services.face_cache_service import FaceCacheService
 from app.ml.pipeline import face_pipeline
+import time as monotonic_timer
 
 class AttendanceDecisionService:
     """
@@ -295,8 +297,10 @@ class AttendanceDecisionService:
         # 7. Check Registered Face Template & Biometric Verification
         face_enforced = getattr(user, "face_enabled", True)
         if face_enforced:
-            face_template = db.query(FaceTemplate).filter(FaceTemplate.user_id == user.id).first()
-            if not face_template or not face_template.face_embedding:
+            t_tpl_start = monotonic_timer.perf_counter_ns()
+            ref_embedding = FaceCacheService.get_user_face_embedding(db, user.id)
+            template_fetch_ms = round((monotonic_timer.perf_counter_ns() - t_tpl_start) / 1_000_000.0, 2)
+            if ref_embedding is None:
                 return record_failure(
                     RejectionReason.NO_FACE_ENROLLED,
                     "No face registered for this employee. Please contact admin to enroll face.",
@@ -305,12 +309,16 @@ class AttendanceDecisionService:
                 )
 
             # 8. PRIMARY BIOMETRIC GATE: Run Deep-Learning Biometric Verification (Face Detection + Liveness + ArcFace)
-            ref_embedding = np.frombuffer(face_template.face_embedding, dtype=np.float32)
-            
+            t_bio_start = monotonic_timer.perf_counter_ns()
             is_match, ml_err_code, ml_msg, sim_score, live_score, ml_details = face_pipeline.verify_live_sequence(
                 frames_bytes_list=frames_bytes_list,
                 reference_embedding=ref_embedding
             )
+            biometric_eval_ms = round((monotonic_timer.perf_counter_ns() - t_bio_start) / 1_000_000.0, 2)
+            if ml_details is None:
+                ml_details = {}
+            ml_details["template_fetch_ms"] = template_fetch_ms
+            ml_details["biometric_total_ms"] = biometric_eval_ms
 
             if not is_match:
                 rejection_reason_enum = RejectionReason.FACE_MISMATCH
@@ -409,8 +417,6 @@ class AttendanceDecisionService:
             details=attempt_details
         )
         db.add(attempt)
-        db.commit()
-        db.refresh(new_attendance)
 
         log_audit_event(
             db=db,
@@ -418,7 +424,6 @@ class AttendanceDecisionService:
             actor_user_id=user.id,
             target_user_id=user.id,
             details={
-                "attendance_id": new_attendance.id,
                 "punch_period_id": active_r_id,
                 "verification_no": active_v_no,
                 "verification_rule_id": active_r_id,
@@ -428,8 +433,12 @@ class AttendanceDecisionService:
                 "liveness_score": live_score,
                 "client_punch_id": client_punch_id
             },
-            ip_address=ip_address
+            ip_address=ip_address,
+            commit=False
         )
+
+        db.commit()
+        db.refresh(new_attendance)
 
         return AttendanceVerifyResponse(
             success=True,

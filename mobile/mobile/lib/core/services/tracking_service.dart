@@ -20,6 +20,16 @@ enum TrackingStatus {
   error,
 }
 
+enum TrackingState {
+  scheduled,
+  active,
+  degraded,
+  interrupted,
+  recovering,
+  completed,
+  incomplete,
+}
+
 class TrackingService with ChangeNotifier {
   static final TrackingService instance = TrackingService._internal();
   TrackingService._internal();
@@ -34,9 +44,13 @@ class TrackingService with ChangeNotifier {
   Timer? _syncTimer;
   Timer? _liveLocationTimer;
   Timer? _streamRecoveryTimer;
+  Timer? _heartbeatTimer;
 
   TrackingStatus _status = TrackingStatus.idle;
   TrackingStatus get status => _status;
+
+  TrackingState _trackingState = TrackingState.scheduled;
+  TrackingState get trackingState => _trackingState;
 
   bool get isTracking => _status == TrackingStatus.active || _status == TrackingStatus.paused;
   bool get isPaused => _status == TrackingStatus.paused;
@@ -212,7 +226,7 @@ class TrackingService with ChangeNotifier {
       }
     }
 
-    // 3. Resolve session UUID
+    // 3. Resolve session UUID with canonical deterministic format
     final savedUuid = prefs.getString('active_tracking_session_uuid');
     final savedDate = prefs.getString('active_tracking_date');
 
@@ -220,11 +234,13 @@ class TrackingService with ChangeNotifier {
     if (savedUuid != null && savedDate == todayStr) {
       sessionUuid = savedUuid;
     } else {
-      sessionUuid = 'TRACK_${userId}_${todayStr}_PUNCH_$punchId';
+      final shiftPart = shiftId != null ? 'SHIFT_$shiftId' : 'PUNCH_$punchId';
+      sessionUuid = 'TRACK_${userId}_${shiftPart}_$todayStr';
     }
 
     _activeSessionUuid = sessionUuid;
     _activeUserId = userId;
+    _trackingState = TrackingState.active;
 
     // 4. Restore or initialize sequence number from SQLite to prevent collisions
     final maxSeq = await _db.getMaxSequenceNumber(sessionUuid);
@@ -358,9 +374,10 @@ class TrackingService with ChangeNotifier {
       debugPrint('[GPS-PIPE] Native background service start error: $e');
     }
 
-    // 11. Start GPS Stream, Live Poller, and Sync Timer
+    // 11. Start GPS Stream, Live Poller, Sync Timer, and Heartbeat
     _startLocationStream();
     _startLiveLocationPolling();
+    _startHeartbeatTimer();
 
     _syncTimer?.cancel();
     _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) => syncPendingPoints());
@@ -376,17 +393,31 @@ class TrackingService with ChangeNotifier {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
 
     _nativeEventSub = NativeBackgroundTracking.eventStream.listen(
-      (data) {
+      (data) async {
         if (data.containsKey('event_type')) {
           final eventType = data['event_type'] as String;
           final details = data['details']?.toString();
           debugPrint('[GPS-PIPE][NATIVE-EVENT] $eventType: $details');
           if (eventType == 'GPS_DISABLED') {
             _gpsError = 'Location services disabled on device.';
-            notifyListeners();
+            await recordInterruption(
+              reasonCode: 'LOCATION_SERVICES_DISABLED',
+              description: 'User or OS disabled location services.',
+              severity: 'CRITICAL',
+            );
           } else if (eventType == 'GPS_RESTORED') {
             _gpsError = null;
-            notifyListeners();
+            await recordRecovery(
+              reasonCode: 'LOCATION_SERVICES_DISABLED',
+              outcome: 'RESOLVED',
+              notes: 'Location services restored by user or OS.',
+            );
+          } else if (eventType == 'SERVICE_STARTED' || eventType == 'SERVICE_RESTARTED') {
+            await recordRecovery(
+              reasonCode: 'BACKGROUND_SERVICE_STOPPED',
+              outcome: 'RESOLVED',
+              notes: 'Foreground service resumed/restarted.',
+            );
           }
           if (_activeSessionUuid != null) {
             _apiClient.post(
@@ -423,6 +454,143 @@ class TrackingService with ChangeNotifier {
         debugPrint('[GPS-PIPE] Native event stream error: $e');
       },
     );
+  }
+
+  void _startHeartbeatTimer() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
+      await sendHeartbeat();
+    });
+  }
+
+  Future<void> sendHeartbeat() async {
+    if (!isActive || _activeSessionUuid == null) return;
+    try {
+      final isGpsEnabled = await Geolocator.isLocationServiceEnabled();
+      final perm = await Geolocator.checkPermission();
+      final isFgRunning = await NativeBackgroundTracking.isServiceRunning();
+
+      final res = await _apiClient.post(
+        '/api/tracking/heartbeat',
+        body: {
+          'session_uuid': _activeSessionUuid,
+          'battery_level': null,
+          'is_charging': null,
+          'network_type': 'ONLINE',
+          'location_services_enabled': isGpsEnabled,
+          'permission_status': perm.name,
+          'is_foreground_service_running': isFgRunning,
+          'last_point_timestamp': _lastRecordedTime?.toIso8601String(),
+        },
+      );
+      if (res is Map && res['should_stop'] == true) {
+        debugPrint('[TrackingService] Backend requested tracking stop (shift concluded)');
+        await stopTrackingForPunchOut();
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Heartbeat deferred (offline): $e');
+    }
+  }
+
+  Future<void> recordInterruption({
+    required String reasonCode,
+    String? description,
+    String severity = 'WARNING',
+    Map<String, dynamic>? diagnostics,
+    bool isConfirmed = true,
+  }) async {
+    if (_activeSessionUuid == null) return;
+    final now = DateTime.now().toUtc();
+    final eventUuid = 'INT_${_activeSessionUuid}_${reasonCode}_${now.millisecondsSinceEpoch}';
+
+    if (reasonCode == 'POOR_ACCURACY') {
+      _trackingState = TrackingState.degraded;
+    } else {
+      _trackingState = TrackingState.interrupted;
+    }
+    _gpsError = description ?? reasonCode;
+    notifyListeners();
+
+    // 1. Record to local SQLite (offline-first durability)
+    await _db.recordInterruptionEvent(
+      eventUuid: eventUuid,
+      sessionUuid: _activeSessionUuid!,
+      userId: _activeUserId ?? 0,
+      reasonCode: reasonCode,
+      description: description ?? 'Tracking interrupted: $reasonCode',
+      detectedAt: now,
+      lastKnownFixAt: _lastRecordedTime,
+      severity: severity,
+      diagnostics: diagnostics,
+      isConfirmed: isConfirmed,
+    );
+
+    // 2. Post immediately if online
+    try {
+      final res = await _apiClient.post(
+        '/api/tracking/interruption',
+        body: {
+          'session_uuid': _activeSessionUuid,
+          'event_uuid': eventUuid,
+          'reason_code': reasonCode,
+          'description': description,
+          'detected_at': now.toIso8601String(),
+          'last_known_location_time': _lastRecordedTime?.toIso8601String(),
+          'severity': severity,
+          'diagnostic_details': diagnostics,
+          'is_confirmed': isConfirmed,
+        },
+      );
+      if (res is Map && res['success'] == true) {
+        await _db.markInterruptionEventsSynced([eventUuid]);
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Interruption event queued offline: $e');
+    }
+  }
+
+  Future<void> recordRecovery({
+    String? reasonCode,
+    String outcome = 'RESOLVED',
+    String? notes,
+  }) async {
+    if (_activeSessionUuid == null) return;
+    final now = DateTime.now().toUtc();
+
+    _trackingState = TrackingState.recovering;
+    notifyListeners();
+
+    // 1. Close event in SQLite
+    final closedEventUuid = await _db.closeInterruptionEvent(
+      sessionUuid: _activeSessionUuid!,
+      reasonCode: reasonCode,
+      recoveredAt: now,
+      outcome: outcome,
+    );
+
+    _gpsError = null;
+    _trackingState = TrackingState.active;
+    notifyListeners();
+
+    // 2. Post recovery to backend
+    try {
+      final res = await _apiClient.post(
+        '/api/tracking/recovery',
+        body: {
+          'session_uuid': _activeSessionUuid,
+          'event_uuid': closedEventUuid,
+          'reason_code': reasonCode,
+          'recovered_at': now.toIso8601String(),
+          'recovery_outcome': outcome,
+          'notes': notes,
+        },
+      );
+      if (res is Map && res['success'] == true && closedEventUuid != null) {
+        await _db.markInterruptionEventsSynced([closedEventUuid]);
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Recovery queued offline: $e');
+    }
   }
 
   Future<bool> _verifyLocationPrerequisites() async {
@@ -564,7 +732,43 @@ class TrackingService with ChangeNotifier {
 
     if (!filterResult.isAccepted) {
       debugPrint('[GPS-PIPE][STAGE 3] Fix rejected: ${filterResult.rejectionReason}');
+      final reason = filterResult.rejectionReason ?? '';
+      if (reason.contains('Accuracy too low')) {
+        await recordInterruption(
+          reasonCode: 'POOR_ACCURACY',
+          description: reason,
+          severity: 'WARNING',
+          diagnostics: {
+            'accuracy_meters': safeFilteredAccuracy,
+            'max_allowed': _distanceCalculator.maxAllowedAccuracyMeters,
+          },
+        );
+      } else if (reason.contains('Implied speed excessive')) {
+        await recordInterruption(
+          reasonCode: 'GPS_GLITCH_UNSTABLE',
+          description: reason,
+          severity: 'WARNING',
+          diagnostics: {
+            'implied_speed': reason,
+          },
+        );
+      }
       return;
+    }
+
+    // Fix accepted: if we were degraded due to POOR_ACCURACY or GPS_GLITCH_UNSTABLE, recover
+    if (_activeSessionUuid != null) {
+      final activeInt = await _db.getActiveInterruption(_activeSessionUuid!);
+      if (activeInt != null) {
+        final code = activeInt['reason_code'] as String?;
+        if (code == 'POOR_ACCURACY' || code == 'GPS_GLITCH_UNSTABLE') {
+          await recordRecovery(
+            reasonCode: code,
+            outcome: 'RESOLVED',
+            notes: 'High-quality GPS coordinates restored (accuracy: ${safeFilteredAccuracy.toStringAsFixed(1)}m).',
+          );
+        }
+      }
     }
 
     debugPrint('[GPS-PIPE][STAGE 3] Fix accepted: +${filterResult.distanceAddedMeters.toStringAsFixed(1)}m, gap=${filterResult.isGap}');
@@ -864,6 +1068,9 @@ class TrackingService with ChangeNotifier {
     _liveLocationTimer = null;
     _syncTimer?.cancel();
     _syncTimer = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _trackingState = TrackingState.completed;
 
     // Stop Native Android Foreground Service
     await NativeBackgroundTracking.stopService();
@@ -1094,6 +1301,43 @@ class TrackingService with ChangeNotifier {
         } catch (_) {}
       }
     } catch (_) {}
+
+    // 4. Sync pending interruption events
+    try {
+      final pendingEvents = await _db.getPendingInterruptionEvents();
+      if (pendingEvents.isNotEmpty) {
+        final eventsPayload = pendingEvents.map((e) {
+          return {
+            'event_uuid': e['event_uuid'],
+            'session_uuid': e['session_uuid'],
+            'reason_code': e['reason_code'],
+            'description': e['description'],
+            'detected_at': e['detected_at'],
+            'last_known_location_time': e['last_known_location_time'],
+            'recovered_at': e['recovered_at'],
+            'duration_seconds': e['duration_seconds'],
+            'severity': e['severity'],
+            'diagnostic_details': e['diagnostic_details'] != null ? jsonDecode(e['diagnostic_details'] as String) : null,
+            'recovery_outcome': e['recovery_outcome'],
+            'is_confirmed': (e['is_confirmed'] ?? 1) == 1,
+          };
+        }).toList();
+
+        debugPrint('[TrackingService] Syncing ${eventsPayload.length} interruption events to /api/tracking/sync-offline-events');
+        final res = await _apiClient.post(
+          '/api/tracking/sync-offline-events',
+          body: {'events': eventsPayload},
+        );
+        if (res is Map && res['success'] == true) {
+          final syncedIds = (res['synced_event_ids'] as List?)?.map((e) => e.toString()).toList() ??
+              pendingEvents.map((e) => e['event_uuid'] as String).toList();
+          await _db.markInterruptionEventsSynced(syncedIds);
+          debugPrint('[TrackingService] Interruption events synced: ${syncedIds.length}');
+        }
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Interruption sync deferred (offline): $e');
+    }
   }
 
   /// Reconciles tracking session upon app restart or process recovery

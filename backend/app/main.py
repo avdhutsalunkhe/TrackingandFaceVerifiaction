@@ -33,11 +33,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Lifespan] Database connection warning: {e}")
 
-    # Initialize / warm up ML models
-    _ = models_manager.detector
-    _ = models_manager.recognizer
-    _ = models_manager.liveness
-    print("[Lifespan] Biometric Pipeline loaded.")
+    # Initialize & warm up biometric ML models
+    if getattr(settings, 'MODEL_WARMUP_ON_STARTUP', True):
+        models_manager.warmup()
+    else:
+        _ = models_manager.detector
+        _ = models_manager.recognizer
+        _ = models_manager.liveness
+    print("[Lifespan] Biometric Pipeline loaded & warmed up.")
     yield
     # Shutdown
     print("[Lifespan] Application shutting down.")
@@ -77,7 +80,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    if exc.status_code == 404:
+    if exc.status_code == 404 and (not exc.detail or exc.detail == "Not Found"):
         return JSONResponse(
             status_code=404,
             content={
@@ -98,6 +101,7 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
         status_code=exc.status_code,
         content={"detail": exc.detail}
     )
+
 
 # Mount all API routes
 app.include_router(api_router)

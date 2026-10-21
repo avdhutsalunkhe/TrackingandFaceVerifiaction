@@ -8,7 +8,8 @@ def log_audit_event(
     actor_user_id: Optional[int] = None,
     target_user_id: Optional[int] = None,
     details: Optional[Dict[str, Any]] = None,
-    ip_address: Optional[str] = None
+    ip_address: Optional[str] = None,
+    commit: bool = True
 ) -> AuditLog:
     """Record an immutable security and audit event."""
     log_entry = AuditLog(
@@ -19,6 +20,7 @@ def log_audit_event(
         ip_address=ip_address
     )
     db.add(log_entry)
-    db.commit()
-    db.refresh(log_entry)
+    if commit:
+        db.commit()
+        db.refresh(log_entry)
     return log_entry

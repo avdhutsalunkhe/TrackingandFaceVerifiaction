@@ -69,7 +69,14 @@ def run_auto_migrations(target_engine):
         safe_add_column("tracking_sessions", "last_accepted_latitude", "DECIMAL(11, 8) NULL")
         safe_add_column("tracking_sessions", "last_accepted_longitude", "DECIMAL(11, 8) NULL")
         safe_add_column("tracking_sessions", "last_accepted_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "last_heartbeat_time", "DATETIME NULL")
         safe_add_column("tracking_sessions", "last_sync_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "shift_start_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "shift_end_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "actual_start_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "actual_stop_time", "DATETIME NULL")
+        safe_add_column("tracking_sessions", "device_id", "VARCHAR(128) NULL")
+        safe_add_column("tracking_sessions", "tracking_completeness", "VARCHAR(32) NOT NULL DEFAULT 'COMPLETE'")
 
         if "tracking_route_chunks" not in tables:
             try:
@@ -78,6 +85,14 @@ def run_auto_migrations(target_engine):
                 print("[AutoMigration] Created tracking_route_chunks table")
             except Exception as ex:
                 print(f"[AutoMigration] Failed creating tracking_route_chunks: {ex}")
+
+        if "tracking_interruption_events" not in tables:
+            try:
+                from app.models.tracking import TrackingInterruptionEvent
+                TrackingInterruptionEvent.__table__.create(target_engine, checkfirst=True)
+                print("[AutoMigration] Created tracking_interruption_events table")
+            except Exception as ex:
+                print(f"[AutoMigration] Failed creating tracking_interruption_events: {ex}")
 
         # Upgrade users role enum & coordinates to full precision DECIMAL(11, 8)
         safe_modify_column("users", "role", "ENUM('ADMIN', 'USER', 'TIME_OFFICE') NOT NULL DEFAULT 'USER'")

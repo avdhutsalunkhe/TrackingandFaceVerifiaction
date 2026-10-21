@@ -130,7 +130,6 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget build(BuildContext context) {
     final isSmall = context.isSmallScreen;
     final double logoSize = isSmall ? 64 : 80;
-    final double iconSize = isSmall ? 36 : 46;
     final double titleSize = isSmall ? 22 : 26;
     final double spacing = isSmall ? 14 : 22;
 
@@ -163,24 +162,22 @@ class _LoginScreenState extends State<LoginScreen> {
                             width: logoSize,
                             height: logoSize,
                             decoration: BoxDecoration(
-                              gradient: const LinearGradient(
-                                colors: [AppColors.primary, AppColors.primaryLight],
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                              ),
+                              color: Colors.white,
                               borderRadius: BorderRadius.circular(isSmall ? 18 : 24),
                               boxShadow: [
                                 BoxShadow(
-                                  color: AppColors.primary.withOpacity(0.3),
+                                  color: Colors.black.withOpacity(0.08),
                                   blurRadius: 15,
-                                  offset: const Offset(0, 8),
+                                  offset: const Offset(0, 6),
                                 ),
                               ],
                             ),
-                            child: Icon(
-                              Icons.fingerprint_rounded,
-                              size: iconSize,
-                              color: Colors.white,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(isSmall ? 18 : 24),
+                              child: Image.asset(
+                                'assets/branding/fieldtrack_app_icon.png',
+                                fit: BoxFit.contain,
+                              ),
                             ),
                           ),
                         ),

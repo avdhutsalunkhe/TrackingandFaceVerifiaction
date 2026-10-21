@@ -136,7 +136,7 @@ class TrackingForegroundService : Service(), LocationListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "FieldStaff Travel Tracking",
+                "FieldTrack Duty Tracking",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Continuous employee journey GPS tracking"
@@ -170,26 +170,26 @@ class TrackingForegroundService : Service(), LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val contentText = when (status) {
-            "Active" -> "Schedule: $scheduleDisplay • Last GPS: $lastFixStr"
-            "Interrupted" -> detailText ?: "Location permissions or GPS unavailable"
-            "Paused" -> "Tracking paused • %.2f km".format(distKm)
-            else -> detailText ?: "Duty GPS Tracking"
+        val statusLine = when (status) {
+            "Active" -> "Field Duty Tracking Active"
+            "Interrupted" -> detailText ?: "Field Duty Tracking Interrupted"
+            "Paused" -> "Field Duty Tracking Paused"
+            else -> detailText ?: "Field Duty Tracking"
         }
 
         val accuracyStr = if (accuracyMeters != null) " (±${accuracyMeters.toInt()}m)" else ""
         val bigText = """
-            Status: $status
+            $statusLine
             Schedule: $scheduleDisplay
             Last GPS update: $lastFixStr$accuracyStr
             Total Travel: %.2f km
         """.trimIndent().format(distKm)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Field Duty Tracking")
-            .setContentText(contentText)
+            .setContentTitle("FieldTrack")
+            .setContentText("$statusLine • Schedule: $scheduleDisplay")
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setSmallIcon(R.drawable.ic_stat_fieldtrack)
             .setOngoing(status == "Active" || status == "Interrupted")
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -574,17 +574,105 @@ class TrackingForegroundService : Service(), LocationListener {
     override fun onProviderEnabled(provider: String) {
         Log.i(TAG, "Provider enabled: $provider")
         updateNotification(status = "Active", detailText = "Location provider $provider enabled")
+        closeInterruptionInDb("LOCATION_SERVICES_DISABLED")
         broadcastHealthEvent("GPS_RESTORED", "Location provider $provider enabled")
     }
 
     override fun onProviderDisabled(provider: String) {
         Log.w(TAG, "Provider disabled: $provider")
         updateNotification(status = "Interrupted", detailText = "Location provider $provider disabled by user")
+        recordInterruptionToDb("LOCATION_SERVICES_DISABLED", "Location provider $provider disabled by user", "WARNING")
         broadcastHealthEvent("GPS_DISABLED", "Location provider $provider disabled by user")
     }
 
     @Deprecated("Deprecated in Java")
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+
+    private fun recordInterruptionToDb(reasonCode: String, description: String, severity: String = "WARNING") {
+        val sUuid = sessionUuid ?: return
+        val nowMs = System.currentTimeMillis()
+        val isoNow = formatIsoUtc(Date(nowMs))
+        val eventUuid = "EV_${reasonCode}_${sUuid}_${nowMs}"
+
+        if (db == null || !db!!.isOpen) {
+            initDatabase()
+        }
+        db?.let { database ->
+            try {
+                val cv = ContentValues().apply {
+                    put("event_uuid", eventUuid)
+                    put("session_uuid", sUuid)
+                    put("user_id", userId)
+                    put("reason_code", reasonCode)
+                    put("description", description)
+                    put("severity", severity)
+                    put("detected_at", isoNow)
+                    if (lastLat != null) put("last_known_latitude", lastLat)
+                    if (lastLng != null) put("last_known_longitude", lastLng)
+                    if (lastFixTimeMs > 0) put("last_known_location_time", formatIsoUtc(Date(lastFixTimeMs)))
+                    put("is_confirmed", 1)
+                    put("recovery_outcome", "UNRESOLVED")
+                    put("sync_status", "PENDING")
+                }
+                database.insertWithOnConflict("offline_interruption_events", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+
+                val sessCv = ContentValues().apply {
+                    put("status", "INTERRUPTED")
+                }
+                database.update("offline_sessions", sessCv, "session_uuid = ?", arrayOf(sUuid))
+            } catch (e: Exception) {
+                Log.e(TAG, "Error writing interruption event to SQLite: $e")
+            }
+        }
+    }
+
+    private fun closeInterruptionInDb(reasonCode: String) {
+        val sUuid = sessionUuid ?: return
+        val nowMs = System.currentTimeMillis()
+        val isoNow = formatIsoUtc(Date(nowMs))
+
+        if (db == null || !db!!.isOpen) {
+            initDatabase()
+        }
+        db?.let { database ->
+            try {
+                val cursor = database.rawQuery(
+                    "SELECT event_uuid, detected_at FROM offline_interruption_events WHERE session_uuid = ? AND reason_code = ? AND recovery_outcome = 'UNRESOLVED' ORDER BY detected_at DESC LIMIT 1",
+                    arrayOf(sUuid, reasonCode)
+                )
+                if (cursor.moveToFirst()) {
+                    val evUuid = cursor.getString(0)
+                    val detectedStr = cursor.getString(1)
+                    var durationSec = 0
+                    try {
+                        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                            timeZone = TimeZone.getTimeZone("UTC")
+                        }
+                        val dDate = sdf.parse(detectedStr)
+                        if (dDate != null) {
+                            durationSec = Math.max(0, ((nowMs - dDate.time) / 1000).toInt())
+                        }
+                    } catch (_: Exception) {}
+
+                    val cv = ContentValues().apply {
+                        put("recovered_at", isoNow)
+                        put("duration_seconds", durationSec)
+                        put("recovery_outcome", "RECOVERED")
+                        put("sync_status", "PENDING")
+                    }
+                    database.update("offline_interruption_events", cv, "event_uuid = ?", arrayOf(evUuid))
+                }
+                cursor.close()
+
+                val sessCv = ContentValues().apply {
+                    put("status", "RECORDING")
+                }
+                database.update("offline_sessions", sessCv, "session_uuid = ?", arrayOf(sUuid))
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing interruption event in SQLite: $e")
+            }
+        }
+    }
 
     private fun broadcastHealthEvent(type: String, details: String) {
         val eventMap = mapOf<String, Any?>(
