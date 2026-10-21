@@ -111,12 +111,32 @@ export default function LiveTrackingMap() {
       zoomControl: false,
     });
 
-    // High quality OpenStreetMap standard tiles
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    // Base Tile Layers: Esri World Imagery (Satellite), Hybrid, and OpenStreetMap
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors',
+      attribution: '&copy; OpenStreetMap contributors',
       referrerPolicy: 'no-referrer-when-downgrade',
-    }).addTo(map);
+    });
+
+    const esriSatellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Tiles &copy; Esri World Imagery',
+    });
+
+    const esriLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Labels &copy; Esri',
+    });
+
+    const esriHybrid = L.layerGroup([esriSatellite, esriLabels]);
+
+    esriHybrid.addTo(map);
+
+    L.control.layers({
+      '🛰️ Satellite Hybrid': esriHybrid,
+      '📸 Pure Satellite': esriSatellite,
+      '🗺️ OpenStreetMap': osmLayer,
+    }, null, { position: 'topright' }).addTo(map);
 
     // Zoom control at bottom-right
     L.control.zoom({ position: 'bottomright' }).addTo(map);

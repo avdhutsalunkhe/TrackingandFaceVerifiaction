@@ -252,10 +252,30 @@ export const EmployeeTravelMapScreen: React.FC = () => {
 
     const map = L.map('map', { zoomControl: false }).setView([initialLat, initialLng], 14);
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '© OpenStreetMap contributors',
       maxZoom: 19
-    }).addTo(map);
+    });
+
+    const esriSatellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri',
+      maxZoom: 19
+    });
+
+    const esriLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Labels © Esri',
+      maxZoom: 19
+    });
+
+    const esriHybrid = L.layerGroup([esriSatellite, esriLabels]);
+
+    esriHybrid.addTo(map);
+
+    L.control.layers({
+      '🛰️ Satellite Hybrid': esriHybrid,
+      '📸 Pure Satellite': esriSatellite,
+      '🗺️ OpenStreetMap': osmLayer
+    }, null, { position: 'topright' }).addTo(map);
 
     if (hasPoints) {
       const latlngs = points.map(p => [p.lat, p.lng]);

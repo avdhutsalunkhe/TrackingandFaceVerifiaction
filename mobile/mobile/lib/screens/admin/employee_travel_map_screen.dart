@@ -12,6 +12,12 @@ import '../../core/services/tracking_database.dart';
 import '../../core/services/route_simplifier.dart';
 import 'employee_table_screen.dart';
 
+enum MapLayerStyle {
+  hybrid,
+  satellite,
+  street,
+}
+
 class EmployeeTravelMapScreen extends StatefulWidget {
   final int? initialEmployeeId;
   final String? initialEmployeeCode;
@@ -33,6 +39,39 @@ class EmployeeTravelMapScreen extends StatefulWidget {
 class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   final MapController _mapController = MapController();
   final ApiClient _apiClient = ApiClient();
+
+  List<Widget> _buildTileLayers() {
+    switch (_selectedMapStyle) {
+      case MapLayerStyle.street:
+        return [
+          TileLayer(
+            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.fieldstaff.attendance',
+            maxZoom: 19,
+          ),
+        ];
+      case MapLayerStyle.satellite:
+        return [
+          TileLayer(
+            urlTemplate: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            maxZoom: 19,
+          ),
+        ];
+      case MapLayerStyle.hybrid:
+        return [
+          // Base: High-resolution Esri World Imagery Satellite
+          TileLayer(
+            urlTemplate: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            maxZoom: 19,
+          ),
+          // Transparent Overlay: Esri World Reference Boundaries, Places & Roads
+          TileLayer(
+            urlTemplate: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+            maxZoom: 19,
+          ),
+        ];
+    }
+  }
 
   // Employee Context State (Resolved from navigation / session)
   int? _resolvedUserId;
@@ -62,6 +101,9 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
   String? _loadError;
   List<Map<String, dynamic>> _interruptionEvents = [];
   bool _isInterruptionHistoryExpanded = true;
+
+  // Map Tile Layer Style (Esri World Imagery Satellite, Hybrid, OpenStreetMap)
+  MapLayerStyle _selectedMapStyle = MapLayerStyle.hybrid;
 
   /// Recalculates simplified polyline vertices using the hybrid route simplification pipeline
   void _recalculateSimplifiedRoute() {
@@ -1935,10 +1977,7 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                     initialZoom: 14.0,
                   ),
                   children: [
-                    TileLayer(
-                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'com.rbpssk.fieldstaff.attendance',
-                    ),
+                    ..._buildTileLayers(),
                     // Polyline route with gap handling
                     if (_routePoints.isNotEmpty)
                       PolylineLayer(
@@ -2191,34 +2230,208 @@ class _EmployeeTravelMapScreenState extends State<EmployeeTravelMapScreen> {
                   ),
                 ),
 
-                // Layer attribution on bottom-right
+                // Map Layer Switcher on top-right
                 Positioned(
+                  top: 14,
                   right: 14,
-                  bottom: 14,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                     decoration: BoxDecoration(
                       color: Colors.white,
-                      borderRadius: BorderRadius.circular(6),
+                      borderRadius: BorderRadius.circular(10),
                       border: Border.all(color: const Color(0xFFCBD5E1)),
                       boxShadow: const [
                         BoxShadow(
-                          color: Color(0x14000000),
-                          blurRadius: 6,
-                          offset: Offset(0, 2),
+                          color: Color(0x1F000000),
+                          blurRadius: 8,
+                          offset: Offset(0, 3),
                         ),
                       ],
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: const [
-                        Icon(Icons.layers_outlined, size: 16, color: Color(0xFF334155)),
-                        SizedBox(width: 6),
-                        Text(
-                          'OpenStreetMap',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF334155)),
+                    child: Material(
+                      color: Colors.transparent,
+                      child: PopupMenuButton<MapLayerStyle>(
+                        tooltip: 'Select Satellite or Street Layer',
+                        initialValue: _selectedMapStyle,
+                        onSelected: (style) {
+                          setState(() {
+                            _selectedMapStyle = style;
+                          });
+                        },
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        offset: const Offset(0, 48),
+                        itemBuilder: (context) => [
+                          PopupMenuItem(
+                            value: MapLayerStyle.hybrid,
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.satellite_alt_rounded,
+                                  color: _selectedMapStyle == MapLayerStyle.hybrid ? const Color(0xFF2563EB) : const Color(0xFF64748B),
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: const [
+                                      Text(
+                                        '🛰️ Satellite Hybrid',
+                                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                      ),
+                                      Text(
+                                        'Esri imagery with road & place labels',
+                                        style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (_selectedMapStyle == MapLayerStyle.hybrid)
+                                  const Icon(Icons.check_rounded, color: Color(0xFF2563EB), size: 18),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: MapLayerStyle.satellite,
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.public_rounded,
+                                  color: _selectedMapStyle == MapLayerStyle.satellite ? const Color(0xFF2563EB) : const Color(0xFF64748B),
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: const [
+                                      Text(
+                                        '📸 Pure Satellite',
+                                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                      ),
+                                      Text(
+                                        'Esri World Imagery aerial photography',
+                                        style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (_selectedMapStyle == MapLayerStyle.satellite)
+                                  const Icon(Icons.check_rounded, color: Color(0xFF2563EB), size: 18),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: MapLayerStyle.street,
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.map_rounded,
+                                  color: _selectedMapStyle == MapLayerStyle.street ? const Color(0xFF2563EB) : const Color(0xFF64748B),
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: const [
+                                      Text(
+                                        '🗺️ Street Map',
+                                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                      ),
+                                      Text(
+                                        'Standard OpenStreetMap vector layout',
+                                        style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (_selectedMapStyle == MapLayerStyle.street)
+                                  const Icon(Icons.check_rounded, color: Color(0xFF2563EB), size: 18),
+                              ],
+                            ),
+                          ),
+                        ],
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _selectedMapStyle == MapLayerStyle.street
+                                    ? Icons.map_rounded
+                                    : (_selectedMapStyle == MapLayerStyle.hybrid ? Icons.satellite_alt_rounded : Icons.public_rounded),
+                                size: 18,
+                                color: const Color(0xFF1E293B),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                _selectedMapStyle == MapLayerStyle.street
+                                    ? 'Street'
+                                    : (_selectedMapStyle == MapLayerStyle.hybrid ? 'Satellite Hybrid' : 'Satellite'),
+                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF1E293B)),
+                              ),
+                              const Icon(Icons.arrow_drop_down, size: 18, color: Color(0xFF64748B)),
+                            ],
+                          ),
                         ),
-                      ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Layer attribution on bottom-right (Clickable toggle)
+                Positioned(
+                  right: 14,
+                  bottom: 14,
+                  child: InkWell(
+                    onTap: () {
+                      setState(() {
+                        if (_selectedMapStyle == MapLayerStyle.hybrid) {
+                          _selectedMapStyle = MapLayerStyle.satellite;
+                        } else if (_selectedMapStyle == MapLayerStyle.satellite) {
+                          _selectedMapStyle = MapLayerStyle.street;
+                        } else {
+                          _selectedMapStyle = MapLayerStyle.hybrid;
+                        }
+                      });
+                    },
+                    borderRadius: BorderRadius.circular(6),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: const Color(0xFFCBD5E1)),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Color(0x14000000),
+                            blurRadius: 6,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _selectedMapStyle == MapLayerStyle.street
+                                ? Icons.layers_outlined
+                                : Icons.satellite_alt_rounded,
+                            size: 15,
+                            color: const Color(0xFF334155),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            _selectedMapStyle == MapLayerStyle.street
+                                ? 'OpenStreetMap'
+                                : (_selectedMapStyle == MapLayerStyle.hybrid ? 'Esri Satellite & OSM' : 'Esri World Imagery'),
+                            style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: Color(0xFF334155)),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
