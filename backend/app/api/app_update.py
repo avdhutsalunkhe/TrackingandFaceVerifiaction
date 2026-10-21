@@ -12,6 +12,8 @@ def _find_release_apk() -> str | None:
         os.path.join(base_dir, "release_apks", "fieldstaff-attendance-universal-release.apk"),
         os.path.join(base_dir, "release_apks", "fieldstaff-attendance-arm64-v8a-release.apk"),
         os.path.join(base_dir, "..", "release_apks", "fieldstaff-attendance-universal-release.apk"),
+        r"D:\Attend\field_staff_attendance_new\release_apks\fieldstaff-attendance-universal-release.apk",
+        r"D:\Attend\field_staff_attendance_new\backend\release_apks\fieldstaff-attendance-universal-release.apk",
         os.path.join(base_dir, "mobile", "release_apks", "fieldstaff-attendance-universal-release.apk"),
         os.path.join(base_dir, "mobile", "mobile", "build", "app", "outputs", "flutter-apk", "app-release.apk"),
     ]
@@ -23,6 +25,8 @@ def _find_release_apk() -> str | None:
 def _get_version_metadata() -> dict:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     meta_candidates = [
+        r"D:\Attend\field_staff_attendance_new\release_apks\version.json",
+        r"D:\Attend\field_staff_attendance_new\backend\release_apks\version.json",
         os.path.join(base_dir, "release_apks", "version.json"),
         os.path.join(base_dir, "..", "release_apks", "version.json"),
         os.path.join(base_dir, "release_apks", "latest_release.json"),

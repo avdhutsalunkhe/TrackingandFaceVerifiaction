@@ -23,7 +23,10 @@ backend/.pytest_cache/
 *.tar.gz
 *.7z
 *.rar
-release_apks/
+release_apks/*
+!release_apks/version.json
+backend/release_apks/*
+!backend/release_apks/version.json
 *.apk
 *.aab
 *.exe

@@ -1,1 +1,15 @@
-{"app_name":"fieldstaff_attendance","version":"1.0.2","build_number":"3","package_name":"fieldstaff_attendance"}
+{
+  "app_name": "fieldstaff_attendance",
+  "version": "1.0.3",
+  "versionCode": 4,
+  "build_number": "4",
+  "package_name": "fieldstaff_attendance",
+  "forceUpdate": false,
+  "minimumSupportedVersionCode": 1,
+  "apkUrl": "/api/app/download-apk",
+  "releaseNotes": [
+    "Mobile admin login enabled strictly for employee face registration",
+    "Dedicated mobile face enrollment dashboard with real-time employee search",
+    "Optimized biometric verification latency and GPS tracking reliability"
+  ]
+}
