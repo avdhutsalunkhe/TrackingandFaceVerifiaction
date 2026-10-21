@@ -9,6 +9,7 @@ import '../../widgets/language_selector.dart';
 import '../../models/user_model.dart';
 import '../auth/login_screen.dart';
 import 'face_enrollment_screen.dart';
+import 'admin_dashboard_screen.dart';
 
 enum FaceFilter { all, pending, enrolled }
 
@@ -191,6 +192,15 @@ class _AdminFaceRegistrationScreenState extends State<AdminFaceRegistrationScree
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.computer_rounded, color: Colors.white),
+            tooltip: 'Full PC Admin Dashboard',
+            onPressed: () {
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (_) => const AdminDashboardScreen()),
+              );
+            },
+          ),
           const LanguageSelectorAction(isDark: true),
           IconButton(
             icon: const Icon(Icons.logout_rounded, color: Colors.white),

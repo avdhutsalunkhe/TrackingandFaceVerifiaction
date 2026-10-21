@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/services/auth_service.dart';
 import '../../core/utils/responsive_util.dart';
+import 'package:flutter/foundation.dart';
 import '../user/user_dashboard_screen.dart';
+import '../admin/admin_dashboard_screen.dart';
 import '../admin/admin_face_registration_screen.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
@@ -75,8 +77,13 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
         final role = profile['role'] ?? 'USER';
         if (!mounted) return;
         if (role == 'ADMIN') {
+          final isMobileView = !kIsWeb || (MediaQuery.of(context).size.width < 800);
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
+            MaterialPageRoute(
+              builder: (_) => isMobileView
+                  ? const AdminFaceRegistrationScreen()
+                  : const AdminDashboardScreen(),
+            ),
           );
         } else {
           Navigator.of(context).pushReplacement(

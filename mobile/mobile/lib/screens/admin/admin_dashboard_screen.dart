@@ -18,6 +18,7 @@ import 'shift_management_screen.dart';
 import 'assign_shift_screen.dart';
 import 'global_settings_dialog.dart';
 import 'attendance_requests_screen.dart';
+import 'admin_face_registration_screen.dart';
 import '../../core/utils/responsive_util.dart';
 
 import '../../core/services/app_update_service.dart';
@@ -91,6 +92,15 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
       appBar: AppBar(
         title: Text(AppTranslations.tr('admin_dashboard')),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.face_retouching_natural_rounded),
+            tooltip: 'Employee Face Registration Portal',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.map_rounded),
             tooltip: 'Employee Travel Route Map',

@@ -7,9 +7,11 @@ import 'core/services/notification_service.dart';
 import 'core/services/tracking_service.dart';
 import 'core/localization/language_service.dart';
 import 'core/localization/app_translations.dart';
+import 'package:flutter/foundation.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/auth/change_password_screen.dart';
 import 'screens/user/user_dashboard_screen.dart';
+import 'screens/admin/admin_dashboard_screen.dart';
 import 'screens/admin/admin_face_registration_screen.dart';
 
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
@@ -110,8 +112,13 @@ class _SplashScreenState extends State<SplashScreen> {
         ),
       );
     } else if (role == 'ADMIN') {
+      final isMobileView = !kIsWeb || (MediaQuery.of(context).size.width < 800);
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
+        MaterialPageRoute(
+          builder: (_) => isMobileView
+              ? const AdminFaceRegistrationScreen()
+              : const AdminDashboardScreen(),
+        ),
       );
     } else {
       final userId = profile['id'] ?? profile['user_id'] ?? 0;

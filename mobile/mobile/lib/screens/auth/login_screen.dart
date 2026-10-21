@@ -7,8 +7,10 @@ import '../../core/localization/app_translations.dart';
 import '../../widgets/language_selector.dart';
 import '../../network/api_client.dart';
 import '../../core/services/device_service.dart';
+import 'package:flutter/foundation.dart';
 import 'change_password_screen.dart';
 import '../user/user_dashboard_screen.dart';
+import '../admin/admin_dashboard_screen.dart';
 import '../admin/admin_face_registration_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -93,8 +95,13 @@ class _LoginScreenState extends State<LoginScreen> {
         );
       } else {
         if (role == 'ADMIN') {
+          final isMobileView = !kIsWeb || (MediaQuery.of(context).size.width < 800);
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const AdminFaceRegistrationScreen()),
+            MaterialPageRoute(
+              builder: (_) => isMobileView
+                  ? const AdminFaceRegistrationScreen()
+                  : const AdminDashboardScreen(),
+            ),
           );
         } else {
           final userId = res['user_id'] ?? 0;
