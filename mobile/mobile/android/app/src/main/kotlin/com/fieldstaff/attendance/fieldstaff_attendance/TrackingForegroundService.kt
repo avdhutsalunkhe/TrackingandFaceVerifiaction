@@ -23,14 +23,20 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.Executors
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Dedicated, persistent Android Foreground Service for continuous employee travel tracking.
@@ -75,6 +81,9 @@ class TrackingForegroundService : Service(), LocationListener {
 
     private var isPaused: Boolean = false
     private var db: SQLiteDatabase? = null
+    private val networkExecutor = Executors.newSingleThreadExecutor()
+    @Volatile
+    private var isBacklogSyncInProgress = false
 
     override fun onCreate() {
         super.onCreate()
@@ -457,8 +466,8 @@ class TrackingForegroundService : Service(), LocationListener {
         val clientPointId = "${sUuid}_pt_${seq}_${nowMs}"
         val isoTimestamp = formatIsoUtc(Date(loc.time))
 
-        // Stage 3: Persist directly to local SQLite
-        persistPointToDb(
+        // Direct real-time upload when online; fallback to SQLite only on failure
+        uploadOrBufferPoint(
             sessionUuid = sUuid,
             clientPointId = clientPointId,
             sequenceNumber = seq,
@@ -468,27 +477,9 @@ class TrackingForegroundService : Service(), LocationListener {
             altitude = loc.altitude,
             speed = if (loc.hasSpeed()) loc.speed.toDouble() else null,
             bearing = if (loc.hasBearing()) loc.bearing.toDouble() else null,
-            recordedAt = isoTimestamp
+            recordedAt = isoTimestamp,
+            totalDistanceMeters = totalDistanceMeters
         )
-
-        // Update notification with new status
-        updateNotification(status = "Active", accuracyMeters = accuracy)
-
-        // Stage 4: Forward to Flutter live stream if engine is attached
-        val pointMap = mapOf<String, Any?>(
-            "session_uuid" to sUuid,
-            "client_point_id" to clientPointId,
-            "sequence_number" to seq,
-            "latitude" to lat,
-            "longitude" to lng,
-            "accuracy_meters" to accuracy.toDouble(),
-            "altitude_meters" to loc.altitude,
-            "speed_mps" to (if (loc.hasSpeed()) loc.speed.toDouble() else null),
-            "bearing_degrees" to (if (loc.hasBearing()) loc.bearing.toDouble() else null),
-            "recorded_at" to isoTimestamp,
-            "total_distance_meters" to totalDistanceMeters
-        )
-        locationEventListener?.invoke(pointMap)
     }
 
     private fun persistPointToDb(
@@ -544,6 +535,302 @@ class TrackingForegroundService : Service(), LocationListener {
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing GPS point to SQLite: $e")
+            }
+        }
+    }
+
+    private fun uploadOrBufferPoint(
+        sessionUuid: String,
+        clientPointId: String,
+        sequenceNumber: Int,
+        latitude: Double,
+        longitude: Double,
+        accuracy: Double,
+        altitude: Double?,
+        speed: Double?,
+        bearing: Double?,
+        recordedAt: String,
+        totalDistanceMeters: Double
+    ) {
+        networkExecutor.execute {
+            var isDirectlyUploaded = false
+            try {
+                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                val token = prefs.getString("flutter.access_token", null)
+                val activeServer = prefs.getString("flutter.active_api_url", null)
+                    ?: prefs.getString("flutter.custom_base_url", null)
+                    ?: "http://182.66.233.66:8084"
+
+                val ptObj = JSONObject().apply {
+                    put("client_point_id", clientPointId)
+                    put("sequence_number", sequenceNumber)
+                    put("latitude", latitude)
+                    put("longitude", longitude)
+                    put("accuracy_meters", accuracy)
+                    if (altitude != null) put("altitude_meters", altitude)
+                    if (speed != null) put("speed_mps", speed)
+                    if (bearing != null) put("bearing_degrees", bearing)
+                    put("recorded_at", recordedAt)
+                    put("is_gap", false)
+                }
+                val pointsArray = JSONArray().apply { put(ptObj) }
+                val rootObj = JSONObject().apply {
+                    put("session_uuid", sessionUuid)
+                    put("points", pointsArray)
+                    put("current_distance_meters", totalDistanceMeters)
+                }
+
+                val candidateUrls = listOfNotNull(
+                    activeServer,
+                    if (activeServer != "http://182.66.233.66:8084") "http://182.66.233.66:8084" else null,
+                    if (activeServer != "http://115.244.240.22:8084") "http://115.244.240.22:8084" else null,
+                    if (activeServer != "http://192.168.1.91:8084") "http://192.168.1.91:8084" else null
+                )
+
+                for (baseUrl in candidateUrls) {
+                    try {
+                        val endpoint = URL("$baseUrl/api/tracking/points")
+                        val conn = (endpoint.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                            setRequestProperty("Accept", "application/json")
+                            if (!token.isNullOrEmpty()) {
+                                setRequestProperty("Authorization", "Bearer $token")
+                            }
+                            connectTimeout = 4000
+                            readTimeout = 5000
+                            doOutput = true
+                            doInput = true
+                        }
+
+                        OutputStreamWriter(conn.outputStream, "UTF-8").use { writer ->
+                            writer.write(rootObj.toString())
+                            writer.flush()
+                        }
+
+                        val responseCode = conn.responseCode
+                        if (responseCode in 200..299) {
+                            val respText = conn.inputStream.bufferedReader().use { it.readText() }
+                            val respJson = JSONObject(respText)
+                            if (respJson.optBoolean("success", true)) {
+                                isDirectlyUploaded = true
+                                Log.i(TAG, "Point $clientPointId uploaded DIRECTLY online to $baseUrl (HTTP $responseCode)")
+                                prefs.edit().putString("flutter.active_api_url", baseUrl).apply()
+                                break
+                            }
+                        } else if (responseCode == 403) {
+                            Log.w(TAG, "Backend rejected tracking point with HTTP 403. Stop capturing.")
+                            break
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Direct upload to $baseUrl failed: ${e.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error in direct upload attempt: $e")
+            }
+
+            if (isDirectlyUploaded) {
+                // Online success: Do NOT write coordinates to offline_route_points!
+                updateSessionSummary(sessionUuid, latitude, longitude, recordedAt, totalDistanceMeters)
+                updateNotification(status = "Active (Live)", accuracyMeters = accuracy.toFloat())
+
+                val pointMap = mapOf<String, Any?>(
+                    "session_uuid" to sessionUuid,
+                    "client_point_id" to clientPointId,
+                    "sequence_number" to sequenceNumber,
+                    "latitude" to latitude,
+                    "longitude" to longitude,
+                    "accuracy_meters" to accuracy,
+                    "altitude_meters" to altitude,
+                    "speed_mps" to speed,
+                    "bearing_degrees" to bearing,
+                    "recorded_at" to recordedAt,
+                    "total_distance_meters" to totalDistanceMeters,
+                    "sync_status" to "SYNCED"
+                )
+                locationEventListener?.invoke(pointMap)
+
+                // Check and trigger backlog sync if offline points were previously buffered
+                syncBacklogPointsAsync(sessionUuid)
+            } else {
+                // Offline fallback: Delivery failed, persist to SQLite with PENDING status
+                Log.w(TAG, "Direct upload failed/offline: Buffering point $clientPointId to offline_route_points")
+                persistPointToDb(
+                    sessionUuid = sessionUuid,
+                    clientPointId = clientPointId,
+                    sequenceNumber = sequenceNumber,
+                    latitude = latitude,
+                    longitude = longitude,
+                    accuracy = accuracy,
+                    altitude = altitude,
+                    speed = speed,
+                    bearing = bearing,
+                    recordedAt = recordedAt
+                )
+                updateNotification(status = "Active (Offline Buffer)", accuracyMeters = accuracy.toFloat())
+
+                val pointMap = mapOf<String, Any?>(
+                    "session_uuid" to sessionUuid,
+                    "client_point_id" to clientPointId,
+                    "sequence_number" to sequenceNumber,
+                    "latitude" to latitude,
+                    "longitude" to longitude,
+                    "accuracy_meters" to accuracy,
+                    "altitude_meters" to altitude,
+                    "speed_mps" to speed,
+                    "bearing_degrees" to bearing,
+                    "recorded_at" to recordedAt,
+                    "total_distance_meters" to totalDistanceMeters,
+                    "sync_status" to "PENDING"
+                )
+                locationEventListener?.invoke(pointMap)
+            }
+        }
+    }
+
+    private fun updateSessionSummary(
+        sessionUuid: String,
+        latitude: Double,
+        longitude: Double,
+        recordedAt: String,
+        totalDistanceMeters: Double
+    ) {
+        if (db == null || !db!!.isOpen) {
+            initDatabase()
+        }
+        db?.let { database ->
+            try {
+                val cv = ContentValues().apply {
+                    put("total_distance_meters", totalDistanceMeters)
+                    put("last_accepted_latitude", latitude)
+                    put("last_accepted_longitude", longitude)
+                    put("last_accepted_time", recordedAt)
+                }
+                database.update(
+                    "offline_sessions",
+                    cv,
+                    "session_uuid = ?",
+                    arrayOf(sessionUuid)
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating session summary: $e")
+            }
+        }
+    }
+
+    private fun syncBacklogPointsAsync(sessionUuid: String) {
+        if (isBacklogSyncInProgress) return
+        networkExecutor.execute {
+            if (isBacklogSyncInProgress) return@execute
+            isBacklogSyncInProgress = true
+            try {
+                if (db == null || !db!!.isOpen) initDatabase()
+                val database = db ?: return@execute
+
+                val cursor = database.rawQuery(
+                    "SELECT client_point_id, sequence_number, latitude, longitude, accuracy_meters, altitude_meters, speed_mps, bearing_degrees, recorded_at " +
+                    "FROM offline_route_points WHERE session_uuid = ? AND sync_status = 'PENDING' ORDER BY sequence_number ASC LIMIT 100",
+                    arrayOf(sessionUuid)
+                )
+
+                val pointsList = mutableListOf<JSONObject>()
+                val clientIds = mutableListOf<String>()
+
+                while (cursor.moveToNext()) {
+                    val cId = cursor.getString(0)
+                    val seq = cursor.getInt(1)
+                    val lat = cursor.getDouble(2)
+                    val lng = cursor.getDouble(3)
+                    val acc = cursor.getDouble(4)
+                    val alt = if (cursor.isNull(5)) null else cursor.getDouble(5)
+                    val spd = if (cursor.isNull(6)) null else cursor.getDouble(6)
+                    val brg = if (cursor.isNull(7)) null else cursor.getDouble(7)
+                    val recAt = cursor.getString(8)
+
+                    clientIds.add(cId)
+                    val pObj = JSONObject().apply {
+                        put("client_point_id", cId)
+                        put("sequence_number", seq)
+                        put("latitude", lat)
+                        put("longitude", lng)
+                        put("accuracy_meters", acc)
+                        if (alt != null) put("altitude_meters", alt)
+                        if (spd != null) put("speed_mps", spd)
+                        if (brg != null) put("bearing_degrees", brg)
+                        put("recorded_at", recAt)
+                        put("is_gap", false)
+                    }
+                    pointsList.add(pObj)
+                }
+                cursor.close()
+
+                if (pointsList.isEmpty()) {
+                    isBacklogSyncInProgress = false
+                    return@execute
+                }
+
+                Log.i(TAG, "Syncing ${pointsList.size} backlog points for session $sessionUuid...")
+                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                val token = prefs.getString("flutter.access_token", null)
+                val baseUrl = prefs.getString("flutter.active_api_url", null) ?: "http://182.66.233.66:8084"
+
+                val payload = JSONObject().apply {
+                    put("session_uuid", sessionUuid)
+                    val arr = JSONArray()
+                    pointsList.forEach { arr.put(it) }
+                    put("points", arr)
+                    put("current_distance_meters", totalDistanceMeters)
+                }
+
+                val conn = (URL("$baseUrl/api/tracking/points").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    setRequestProperty("Accept", "application/json")
+                    if (!token.isNullOrEmpty()) {
+                        setRequestProperty("Authorization", "Bearer $token")
+                    }
+                    connectTimeout = 6000
+                    readTimeout = 10000
+                    doOutput = true
+                    doInput = true
+                }
+
+                OutputStreamWriter(conn.outputStream, "UTF-8").use {
+                    it.write(payload.toString())
+                    it.flush()
+                }
+
+                if (conn.responseCode in 200..299) {
+                    val respText = conn.inputStream.bufferedReader().use { it.readText() }
+                    val respJson = JSONObject(respText)
+                    val confirmedIds = mutableListOf<String>()
+                    val syncedArr = respJson.optJSONArray("synced_point_ids")
+                    if (syncedArr != null && syncedArr.length() > 0) {
+                        for (i in 0 until syncedArr.length()) {
+                            confirmedIds.add(syncedArr.getString(i))
+                        }
+                    } else {
+                        confirmedIds.addAll(clientIds)
+                    }
+
+                    // Delete confirmed backlog points from SQLite in chunks of 500
+                    database.beginTransaction()
+                    try {
+                        for (chunk in confirmedIds.chunked(500)) {
+                            val placeholders = chunk.joinToString(",") { "?" }
+                            database.delete("offline_route_points", "client_point_id IN ($placeholders)", chunk.toTypedArray())
+                        }
+                        database.setTransactionSuccessful()
+                    } finally {
+                        database.endTransaction()
+                    }
+                    Log.i(TAG, "Successfully synced and purged ${confirmedIds.size} backlog points from SQLite.")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Backlog synchronization deferred: $e")
+            } finally {
+                isBacklogSyncInProgress = false
             }
         }
     }
@@ -621,6 +908,9 @@ class TrackingForegroundService : Service(), LocationListener {
             db?.close()
         } catch (_: Exception) {}
         db = null
+        try {
+            networkExecutor.shutdown()
+        } catch (_: Exception) {}
         Log.i(TAG, "TrackingForegroundService onDestroy")
     }
 

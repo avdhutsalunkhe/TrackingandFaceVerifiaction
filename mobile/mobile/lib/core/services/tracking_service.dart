@@ -449,6 +449,10 @@ class TrackingService with ChangeNotifier {
           _lastRecordedPosition = LatLng(lat, lng);
           _lastRecordedTime = DateTime.now().toUtc();
           _currentAccuracy = (data['accuracy_meters'] as num?)?.toDouble();
+          final syncStatus = data['sync_status']?.toString();
+          if (syncStatus == 'SYNCED') {
+            _lastSyncTime = DateTime.now();
+          }
           if (dist != null && dist > _totalDistanceMeters) {
             _totalDistanceMeters = dist;
             _distanceStreamController.add(_totalDistanceMeters);
@@ -1167,12 +1171,14 @@ class TrackingService with ChangeNotifier {
       }
     } catch (_) {}
 
-    // 2. Sync pending compressed route chunks (Production storage-efficient protocol)
-    try {
-      final pendingChunks = await _db.getPendingRouteChunks();
-      if (pendingChunks.isNotEmpty) {
-        final grouped = <String, List<Map<String, dynamic>>>{};
-        for (final c in pendingChunks) {
+    // 2. Sync pending backlog coordinates (only if pending records exist in SQLite)
+    final pendingCount = await _db.getPendingPointCount();
+    if (pendingCount > 0) {
+      try {
+        final pendingChunks = await _db.getPendingRouteChunks();
+        if (pendingChunks.isNotEmpty) {
+          final grouped = <String, List<Map<String, dynamic>>>{};
+          for (final c in pendingChunks) {
           final suuid = c['session_uuid'] as String;
           grouped.putIfAbsent(suuid, () => []).add(c);
         }
@@ -1287,6 +1293,7 @@ class TrackingService with ChangeNotifier {
     } catch (e) {
       debugPrint('[GPS-PIPE][STAGE 6] Sync pending points deferred (offline): $e');
     }
+  }
 
     // 3. Sync pending session completions
     try {

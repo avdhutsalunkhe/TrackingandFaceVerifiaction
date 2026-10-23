@@ -76,6 +76,14 @@ class ApiFailoverManager {
       debugPrint('[ApiFailoverManager] Startup ping error: $e');
       _activeUrl = ApiConfig.primaryApiUrl;
     }
+    await _persistActiveUrl();
+  }
+
+  Future<void> _persistActiveUrl() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('active_api_url', _activeUrl);
+    } catch (_) {}
   }
 
   /// Concurrently ping candidate servers with a fast timeout and return the first responding URL
@@ -159,6 +167,7 @@ class ApiFailoverManager {
         startRecoveryChecker();
       }
 
+      await _persistActiveUrl();
       completer.complete(_activeUrl);
       return _activeUrl;
     } catch (e) {
