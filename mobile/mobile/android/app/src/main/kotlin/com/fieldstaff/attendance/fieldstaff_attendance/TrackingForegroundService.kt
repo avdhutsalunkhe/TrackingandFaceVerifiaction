@@ -76,6 +76,7 @@ class TrackingForegroundService : Service(), LocationListener {
     private var lastLat: Double? = null
     private var lastLng: Double? = null
     private var lastFixTimeMs: Long = 0L
+    private var lastUploadTimeMs: Long = 0L
 
     private val kalmanFilter = AndroidKalmanLatLongFilter(qMetersPerSecond = 3.0)
 
@@ -125,9 +126,25 @@ class TrackingForegroundService : Service(), LocationListener {
                 totalDistanceMeters = prefs.getFloat("flutter.active_tracking_distance", 0.0f).toDouble()
 
                 if (sessionUuid == null) {
-                    Log.w(TAG, "No active session UUID found in intent or preferences. Stopping service.")
-                    stopSelf()
-                    return START_NOT_STICKY
+                    val fallbackUserId = if (userId > 0) userId else prefs.getLong("flutter.user_id", 0L).toInt()
+                    if (fallbackUserId > 0) {
+                        val tzId = prefs.getString("flutter.tracking_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
+                        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+                            timeZone = TimeZone.getTimeZone(tzId)
+                        }.format(Date())
+                        sessionUuid = "TRACK_${fallbackUserId}_GENERAL_${todayStr}"
+                        userId = fallbackUserId
+                        prefs.edit()
+                            .putString("flutter.active_tracking_session_uuid", sessionUuid)
+                            .putLong("flutter.active_tracking_user_id", fallbackUserId.toLong())
+                            .putString("flutter.active_tracking_date", todayStr)
+                            .apply()
+                        Log.i(TAG, "Auto-created canonical fallback sessionUuid: $sessionUuid")
+                    } else {
+                        Log.w(TAG, "No active session UUID or userId found. Stopping service.")
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
                 }
 
                 // Restore last known coordinates and sequence number from SQLite
@@ -169,7 +186,7 @@ class TrackingForegroundService : Service(), LocationListener {
         val is24x7 = prefs.getBoolean("flutter.tracking_mode_24x7", true)
         val startTimeStr = prefs.getString("flutter.tracking_schedule_start", "08:00 AM") ?: "08:00 AM"
         val endTimeStr = prefs.getString("flutter.tracking_schedule_end", "06:00 PM") ?: "06:00 PM"
-        val scheduleDisplay = if (is24x7) "24*7 Continuous" else "$startTimeStr – $endTimeStr"
+        val schedulePart = if (!is24x7 && startTimeStr.isNotEmpty() && endTimeStr.isNotEmpty()) " • Schedule: $startTimeStr – $endTimeStr" else ""
 
         val timeFormat = SimpleDateFormat("hh:mm a", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("Asia/Kolkata")
@@ -191,6 +208,8 @@ class TrackingForegroundService : Service(), LocationListener {
 
         val statusLine = when (status) {
             "Active" -> "Field Duty Tracking Active"
+            "Active (Live)" -> "Field Duty Tracking (Live)"
+            "Active (Offline Buffer)" -> "Field Duty Tracking (Offline)"
             "Interrupted" -> detailText ?: "Field Duty Tracking Interrupted"
             "Paused" -> "Field Duty Tracking Paused"
             else -> detailText ?: "Field Duty Tracking"
@@ -198,7 +217,11 @@ class TrackingForegroundService : Service(), LocationListener {
 
         val accuracyStr = if (accuracyMeters != null) " (±${accuracyMeters.toInt()}m)" else ""
         val formattedDist = String.format(Locale.US, "%.2f", distKm)
-        val bigText = "$statusLine\nSchedule: $scheduleDisplay\nLast GPS update: $lastFixStr$accuracyStr\nTotal Travel: $formattedDist km"
+        val bigText = if (schedulePart.isNotEmpty()) {
+            "$statusLine$schedulePart\nLast GPS update: $lastFixStr$accuracyStr\nTotal Travel: $formattedDist km"
+        } else {
+            "$statusLine\nLast GPS update: $lastFixStr$accuracyStr\nTotal Travel: $formattedDist km"
+        }
 
         val iconRes = try {
             val resId = resources.getIdentifier("ic_stat_fieldtrack", "drawable", packageName)
@@ -209,10 +232,10 @@ class TrackingForegroundService : Service(), LocationListener {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("FieldTrack")
-            .setContentText("$statusLine • Schedule: $scheduleDisplay")
+            .setContentText("$statusLine$schedulePart")
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setSmallIcon(iconRes)
-            .setOngoing(status == "Active" || status == "Interrupted")
+            .setOngoing(status.startsWith("Active") || status == "Interrupted")
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -443,10 +466,14 @@ class TrackingForegroundService : Service(), LocationListener {
             }
         }
 
-        // Stage 5: Stationary Drift Suppression (Dead-Reckoning Threshold)
-        // Speeds < 0.4 m/s with displacement < 4.0m are filtered out to prevent stationary drift
+        // Stage 5: Stationary Drift Suppression & Keep-Alive Rate Limiter
         val isStationary = loc.hasSpeed() && loc.speed < 0.4f && stepDist < 4.0
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val timeSinceLastUpload = if (lastUploadTimeMs > 0L) (nowMs - lastUploadTimeMs) else 0L
+
+        // Upload live if moved >= 8m, OR initial position, OR periodic keep-alive every 90s when stationary
+        val shouldUpload = (stepDist >= 8.0 && !isStationary) || lastLat == null || timeSinceLastUpload >= 90000L
+
         if (!isStationary && stepDist >= 8.0) {
             totalDistanceMeters += stepDist
             lastLat = lat
@@ -461,12 +488,17 @@ class TrackingForegroundService : Service(), LocationListener {
             lastFixTimeMs = nowMs
         }
 
+        if (!shouldUpload) {
+            return
+        }
+
+        lastUploadTimeMs = nowMs
         val seq = sequenceNumber++
         prefs.edit().putInt("tracking_last_seq_$sUuid", seq).apply()
         val clientPointId = "${sUuid}_pt_${seq}_${nowMs}"
         val isoTimestamp = formatIsoUtc(Date(loc.time))
 
-        // Direct real-time upload when online; fallback to SQLite only on failure
+        // Direct real-time upload when online; fallback to SQLite only on network failure
         uploadOrBufferPoint(
             sessionUuid = sUuid,
             clientPointId = clientPointId,
@@ -556,7 +588,7 @@ class TrackingForegroundService : Service(), LocationListener {
             var isDirectlyUploaded = false
             try {
                 val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                val token = prefs.getString("flutter.access_token", null)
+                var token = prefs.getString("flutter.access_token", null)
                 val activeServer = prefs.getString("flutter.active_api_url", null)
                     ?: prefs.getString("flutter.custom_base_url", null)
                     ?: "http://182.66.233.66:8084"
@@ -582,10 +614,10 @@ class TrackingForegroundService : Service(), LocationListener {
 
                 val candidateUrls = listOfNotNull(
                     activeServer,
+                    if (activeServer != "http://192.168.1.91:8084") "http://192.168.1.91:8084" else null,
                     if (activeServer != "http://182.66.233.66:8084") "http://182.66.233.66:8084" else null,
-                    if (activeServer != "http://115.244.240.22:8084") "http://115.244.240.22:8084" else null,
-                    if (activeServer != "http://192.168.1.91:8084") "http://192.168.1.91:8084" else null
-                )
+                    if (activeServer != "http://115.244.240.22:8084") "http://115.244.240.22:8084" else null
+                ).distinct()
 
                 for (baseUrl in candidateUrls) {
                     try {
@@ -608,8 +640,40 @@ class TrackingForegroundService : Service(), LocationListener {
                             writer.flush()
                         }
 
-                        val responseCode = conn.responseCode
-                        if (responseCode in 200..299) {
+                        var responseCode = conn.responseCode
+
+                        // Handle token expiration: automatically refresh in background and retry
+                        if (responseCode == 401) {
+                            Log.w(TAG, "Access token expired (HTTP 401). Refreshing token in background...")
+                            val refreshedToken = attemptTokenRefresh(baseUrl)
+                            if (!refreshedToken.isNullOrEmpty()) {
+                                token = refreshedToken
+                                val retryConn = (endpoint.openConnection() as HttpURLConnection).apply {
+                                    requestMethod = "POST"
+                                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                                    setRequestProperty("Accept", "application/json")
+                                    setRequestProperty("Authorization", "Bearer $token")
+                                    connectTimeout = 4000
+                                    readTimeout = 5000
+                                    doOutput = true
+                                    doInput = true
+                                }
+                                OutputStreamWriter(retryConn.outputStream, "UTF-8").use { writer ->
+                                    writer.write(rootObj.toString())
+                                    writer.flush()
+                                }
+                                responseCode = retryConn.responseCode
+                                if (responseCode in 200..299) {
+                                    val retryText = retryConn.inputStream.bufferedReader().use { it.readText() }
+                                    if (JSONObject(retryText).optBoolean("success", true)) {
+                                        isDirectlyUploaded = true
+                                        Log.i(TAG, "Point $clientPointId uploaded DIRECTLY online after token refresh (HTTP $responseCode)")
+                                        prefs.edit().putString("flutter.active_api_url", baseUrl).apply()
+                                        break
+                                    }
+                                }
+                            }
+                        } else if (responseCode in 200..299) {
                             val respText = conn.inputStream.bufferedReader().use { it.readText() }
                             val respJson = JSONObject(respText)
                             if (respJson.optBoolean("success", true)) {
@@ -772,8 +836,10 @@ class TrackingForegroundService : Service(), LocationListener {
 
                 Log.i(TAG, "Syncing ${pointsList.size} backlog points for session $sessionUuid...")
                 val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                val token = prefs.getString("flutter.access_token", null)
-                val baseUrl = prefs.getString("flutter.active_api_url", null) ?: "http://182.66.233.66:8084"
+                var token = prefs.getString("flutter.access_token", null)
+                val activeServer = prefs.getString("flutter.active_api_url", null)
+                    ?: prefs.getString("flutter.custom_base_url", null)
+                    ?: "http://182.66.233.66:8084"
 
                 val payload = JSONObject().apply {
                     put("session_uuid", sessionUuid)
@@ -783,38 +849,92 @@ class TrackingForegroundService : Service(), LocationListener {
                     put("current_distance_meters", totalDistanceMeters)
                 }
 
-                val conn = (URL("$baseUrl/api/tracking/points").openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                    setRequestProperty("Accept", "application/json")
-                    if (!token.isNullOrEmpty()) {
-                        setRequestProperty("Authorization", "Bearer $token")
-                    }
-                    connectTimeout = 6000
-                    readTimeout = 10000
-                    doOutput = true
-                    doInput = true
-                }
+                val candidateUrls = listOfNotNull(
+                    activeServer,
+                    if (activeServer != "http://192.168.1.91:8084") "http://192.168.1.91:8084" else null,
+                    if (activeServer != "http://182.66.233.66:8084") "http://182.66.233.66:8084" else null,
+                    if (activeServer != "http://115.244.240.22:8084") "http://115.244.240.22:8084" else null
+                ).distinct()
 
-                OutputStreamWriter(conn.outputStream, "UTF-8").use {
-                    it.write(payload.toString())
-                    it.flush()
-                }
+                var syncedSuccess = false
+                val confirmedIds = mutableListOf<String>()
 
-                if (conn.responseCode in 200..299) {
-                    val respText = conn.inputStream.bufferedReader().use { it.readText() }
-                    val respJson = JSONObject(respText)
-                    val confirmedIds = mutableListOf<String>()
-                    val syncedArr = respJson.optJSONArray("synced_point_ids")
-                    if (syncedArr != null && syncedArr.length() > 0) {
-                        for (i in 0 until syncedArr.length()) {
-                            confirmedIds.add(syncedArr.getString(i))
+                for (baseUrl in candidateUrls) {
+                    try {
+                        val endpoint = URL("$baseUrl/api/tracking/points")
+                        val conn = (endpoint.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                            setRequestProperty("Accept", "application/json")
+                            if (!token.isNullOrEmpty()) {
+                                setRequestProperty("Authorization", "Bearer $token")
+                            }
+                            connectTimeout = 6000
+                            readTimeout = 10000
+                            doOutput = true
+                            doInput = true
                         }
-                    } else {
-                        confirmedIds.addAll(clientIds)
-                    }
 
-                    // Delete confirmed backlog points from SQLite in chunks of 500
+                        OutputStreamWriter(conn.outputStream, "UTF-8").use {
+                            it.write(payload.toString())
+                            it.flush()
+                        }
+
+                        var responseCode = conn.responseCode
+                        if (responseCode == 401) {
+                            val refreshed = attemptTokenRefresh(baseUrl)
+                            if (!refreshed.isNullOrEmpty()) {
+                                token = refreshed
+                                val retryConn = (endpoint.openConnection() as HttpURLConnection).apply {
+                                    requestMethod = "POST"
+                                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                                    setRequestProperty("Accept", "application/json")
+                                    setRequestProperty("Authorization", "Bearer $token")
+                                    connectTimeout = 6000
+                                    readTimeout = 10000
+                                    doOutput = true
+                                    doInput = true
+                                }
+                                OutputStreamWriter(retryConn.outputStream, "UTF-8").use {
+                                    it.write(payload.toString())
+                                    it.flush()
+                                }
+                                responseCode = retryConn.responseCode
+                                if (responseCode in 200..299) {
+                                    val retryText = retryConn.inputStream.bufferedReader().use { it.readText() }
+                                    val retryJson = JSONObject(retryText)
+                                    val syncedArr = retryJson.optJSONArray("synced_point_ids")
+                                    if (syncedArr != null && syncedArr.length() > 0) {
+                                        for (i in 0 until syncedArr.length()) {
+                                            confirmedIds.add(syncedArr.getString(i))
+                                        }
+                                    } else {
+                                        confirmedIds.addAll(clientIds)
+                                    }
+                                    syncedSuccess = true
+                                    break
+                                }
+                            }
+                        } else if (responseCode in 200..299) {
+                            val respText = conn.inputStream.bufferedReader().use { it.readText() }
+                            val respJson = JSONObject(respText)
+                            val syncedArr = respJson.optJSONArray("synced_point_ids")
+                            if (syncedArr != null && syncedArr.length() > 0) {
+                                for (i in 0 until syncedArr.length()) {
+                                    confirmedIds.add(syncedArr.getString(i))
+                                }
+                            } else {
+                                confirmedIds.addAll(clientIds)
+                            }
+                            syncedSuccess = true
+                            break
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Backlog sync to $baseUrl failed: ${e.message}")
+                    }
+                }
+
+                if (syncedSuccess && confirmedIds.isNotEmpty()) {
                     database.beginTransaction()
                     try {
                         for (chunk in confirmedIds.chunked(500)) {
@@ -833,6 +953,53 @@ class TrackingForegroundService : Service(), LocationListener {
                 isBacklogSyncInProgress = false
             }
         }
+    }
+
+    private fun attemptTokenRefresh(baseUrl: String): String? {
+        try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val refreshToken = prefs.getString("flutter.refresh_token", null) ?: return null
+            val deviceId = prefs.getString("flutter.device_id", "") ?: ""
+            val refreshUrl = URL("$baseUrl/api/auth/refresh")
+            val conn = (refreshUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                connectTimeout = 4000
+                readTimeout = 5000
+                doOutput = true
+                doInput = true
+            }
+            val payload = JSONObject().apply {
+                put("refresh_token", refreshToken)
+                put("device_id", deviceId)
+                put("client_type", "MOBILE")
+            }
+            OutputStreamWriter(conn.outputStream, "UTF-8").use {
+                it.write(payload.toString())
+                it.flush()
+            }
+            if (conn.responseCode in 200..299) {
+                val respText = conn.inputStream.bufferedReader().use { it.readText() }
+                val respJson = JSONObject(respText)
+                val newAccessToken = respJson.optString("access_token", null)
+                val newRefreshToken = respJson.optString("refresh_token", null)
+                if (!newAccessToken.isNullOrEmpty()) {
+                    val editor = prefs.edit().putString("flutter.access_token", newAccessToken)
+                    if (!newRefreshToken.isNullOrEmpty()) {
+                        editor.putString("flutter.refresh_token", newRefreshToken)
+                    }
+                    editor.apply()
+                    Log.i(TAG, "Successfully refreshed access token in background service")
+                    return newAccessToken
+                }
+            } else {
+                Log.w(TAG, "Background token refresh failed with HTTP ${conn.responseCode}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error during background token refresh: $e")
+        }
+        return null
     }
 
     private fun pauseTracking() {

@@ -29,6 +29,7 @@
             android:name=".TrackingForegroundService"
             android:enabled="true"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="location|dataSync" />
 
         <!-- Native Boot & Restart Recovery Receiver -->
