@@ -11,9 +11,6 @@
 .svn/
 .swiftpm/
 migrate_working_dir/
-*.db
-*.zip
-*.crdownload
 
 # IntelliJ related
 *.iml
