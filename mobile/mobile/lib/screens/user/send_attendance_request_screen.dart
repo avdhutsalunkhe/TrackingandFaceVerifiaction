@@ -10,6 +10,7 @@ import '../../core/constants/api_constants.dart';
 import '../../core/network/api_client.dart';
 import '../../core/services/location_service.dart';
 import '../../core/services/server_time_service.dart';
+import '../../core/services/offline_attendance_service.dart';
 import '../../core/utils/responsive_util.dart';
 
 class SendAttendanceRequestScreen extends StatefulWidget {
@@ -53,6 +54,7 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
   Uint8List? _capturedImageBytes;
   bool _isPreviewing = false;
   String? _clientRequestId;
+  bool _includeData = true;
 
   @override
   void initState() {
@@ -61,6 +63,12 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
     _serverTimeService.init();
     _initCamera();
     _resolveLocation();
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    super.dispose();
   }
 
   Future<void> _initCamera() async {
@@ -306,20 +314,26 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
 
       final nowDevice = DateTime.now().toIso8601String();
 
+      final fields = <String, String>{
+        'latitude': (_includeData && hasValidGps) ? _latitude.toString() : '0.0',
+        'longitude': (_includeData && hasValidGps) ? _longitude.toString() : '0.0',
+        'location_name': _includeData ? _locationName : 'Location data omitted by user',
+        'device_timestamp': nowDevice,
+        'reason': widget.reason ?? 'Face verification assistance',
+      };
+      if (_includeData && hasValidGps && _accuracy != null) {
+        fields['accuracy'] = _accuracy.toString();
+      }
+      if (widget.verificationNo != null) {
+        fields['verification_no'] = widget.verificationNo.toString();
+      }
+      if (_clientRequestId != null) {
+        fields['client_request_id'] = _clientRequestId!;
+      }
+
       final res = await _apiClient.postMultipart(
         endpoint: ApiConstants.submitAttendanceRequest,
-        fields: {
-          'latitude': hasValidGps ? _latitude.toString() : '0.0',
-          'longitude': hasValidGps ? _longitude.toString() : '0.0',
-          'location_name': _locationName,
-          if (hasValidGps && _accuracy != null) 'accuracy': _accuracy.toString(),
-          'device_timestamp': nowDevice,
-          'reason': widget.reason ?? 'Face verification failed',
-          if (widget.verificationNo != null)
-            'verification_no': widget.verificationNo.toString(),
-          if (_clientRequestId != null)
-            'client_request_id': _clientRequestId!,
-        },
+        fields: fields,
         files: [
           MapEntry('selfie', _rawImageBytes ?? _capturedImageBytes!),
         ],
@@ -437,6 +451,34 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
       );
     } catch (e) {
       if (!mounted) return;
+
+      // Fallback: If network down or server offline, store image in binary format in SQLite3 database!
+      final bool isOfflineError = (e is ApiException && (e.isNetworkFailure || e.isTimeout || e.isServerError)) ||
+          e.toString().contains('SocketException') ||
+          e.toString().contains('Connection') ||
+          e.toString().contains('ClientException') ||
+          e.toString().contains('Timeout') ||
+          e.toString().contains('Failed host lookup');
+
+      if (isOfflineError) {
+        final saved = await OfflineAttendanceService.instance.enqueueOfflineSelfieRequest(
+          clientRequestId: _clientRequestId ?? 'req_${DateTime.now().millisecondsSinceEpoch}',
+          latitude: _includeData ? _latitude : 0.0,
+          longitude: _includeData ? _longitude : 0.0,
+          accuracy: _includeData ? _accuracy : null,
+          locationName: _includeData ? _locationName : 'Location data omitted by user',
+          reason: widget.reason ?? 'Face verification assistance',
+          verificationNo: widget.verificationNo,
+          includeData: _includeData,
+          imageBytes: _rawImageBytes ?? _capturedImageBytes!,
+        );
+
+        if (saved && mounted) {
+          _showOfflineSavedDialog();
+          return;
+        }
+      }
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(e.toString().replaceFirst('Exception: ', '')),
@@ -448,10 +490,121 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
     }
   }
 
-  @override
-  void dispose() {
-    _cameraController?.dispose();
-    super.dispose();
+  void _showOfflineSavedDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Column(
+          children: const [
+            Icon(Icons.cloud_off_rounded, color: Color(0xFFF59E0B), size: 56),
+            SizedBox(height: 12),
+            Text(
+              'Saved to Offline Storage',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
+            ),
+          ],
+        ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'The server or mobile network is currently unavailable. Your live selfie image has been stored in binary format directly in your device\'s local SQLite3 database.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 14, color: AppColors.textPrimary),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFEF3C7),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFFFDE68A)),
+                  ),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Request ID:', style: TextStyle(color: Color(0xFF92400E), fontSize: 13)),
+                          Text(
+                            _clientRequestId ?? 'N/A',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF92400E)),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Telemetry Data:', style: TextStyle(color: Color(0xFF92400E), fontSize: 13)),
+                          Text(
+                            _includeData ? 'YES (GPS & Time)' : 'NO (Selfie Only)',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF92400E)),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Offline Status:', style: TextStyle(color: Color(0xFF92400E), fontSize: 13)),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFD97706),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Text(
+                              'QUEUED IN SQLITE',
+                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: const [
+                    Icon(Icons.sync_rounded, color: AppColors.primary, size: 18),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Your selfie will automatically synchronize to Admin for review once network connectivity is restored.',
+                        style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          Center(
+            child: ElevatedButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                Navigator.pop(context, true);
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              child: const Text('Back to Dashboard'),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -655,7 +808,70 @@ class _SendAttendanceRequestScreenState extends State<SendAttendanceRequestScree
                 ),
               ),
 
-              const SizedBox(height: 16),
+              const SizedBox(height: 10),
+
+              // Option: Send Selfie with Data (Yes or No)
+              if (_isPreviewing)
+                Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: _includeData ? AppColors.secondary.withOpacity(0.5) : const Color(0xFF334155),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _includeData ? Icons.location_on_rounded : Icons.location_off_rounded,
+                        color: _includeData ? AppColors.secondary : Colors.white38,
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                const Text(
+                                  'Send with Telemetry Data',
+                                  style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                                ),
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: _includeData ? const Color(0xFF065F46) : const Color(0xFF475569),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    _includeData ? 'YES' : 'NO',
+                                    style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              _includeData ? 'Attaches live GPS location & timestamp' : 'Selfie image only (omits GPS/telemetry)',
+                              style: const TextStyle(color: Colors.white60, fontSize: 11),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Switch(
+                        value: _includeData,
+                        activeColor: AppColors.secondary,
+                        onChanged: (val) {
+                          setState(() => _includeData = val);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
 
               // Action Buttons
               Padding(

@@ -2,21 +2,27 @@ package com.fieldstaff.attendance.fieldstaff_attendance
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {
 
     companion object {
         private const val METHOD_CHANNEL = "com.fieldstaff.attendance/background_tracking"
         private const val EVENT_CHANNEL = "com.fieldstaff.attendance/background_tracking_events"
+        private const val UPDATE_CHANNEL = "com.fieldstaff.attendance/app_update"
     }
 
     private var eventSink: EventChannel.EventSink? = null
@@ -163,5 +169,112 @@ class MainActivity : FlutterActivity() {
                 }
             }
         )
+
+        // Setup MethodChannel for Developer-Controlled App Update & Package Installation
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATE_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getDistributionChannel" -> {
+                    try {
+                        val installer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            packageManager.getInstallSourceInfo(packageName).installingPackageName
+                        } else {
+                            @Suppress("DEPRECATION")
+                            packageManager.getInstallerPackageName(packageName)
+                        }
+                        if (installer == "com.android.vending") {
+                            result.success("google_play")
+                        } else {
+                            result.success("direct_apk")
+                        }
+                    } catch (e: Exception) {
+                        result.success("direct_apk")
+                    }
+                }
+                "canRequestPackageInstalls" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        result.success(packageManager.canRequestPackageInstalls())
+                    } else {
+                        result.success(true)
+                    }
+                }
+                "openInstallPermissionSettings" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                                data = Uri.parse("package:$packageName")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(intent)
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SETTINGS_OPEN_FAILED", e.message, null)
+                    }
+                }
+                "installApk" -> {
+                    val filePath = call.argument<String>("filePath")
+                    if (filePath.isNullOrEmpty()) {
+                        result.error("INVALID_PATH", "File path cannot be null or empty", null)
+                        return@setMethodCallHandler
+                    }
+
+                    val apkFile = File(filePath)
+                    if (!apkFile.exists()) {
+                        result.error("FILE_NOT_FOUND", "APK file does not exist at $filePath", null)
+                        return@setMethodCallHandler
+                    }
+
+                    try {
+                        // Strict Security: Verify APK package name matches app
+                        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            packageManager.getPackageArchiveInfo(filePath, PackageManager.PackageInfoFlags.of(0))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            packageManager.getPackageArchiveInfo(filePath, 0)
+                        }
+
+                        if (packageInfo != null && packageInfo.packageName != packageName) {
+                            result.error(
+                                "PACKAGE_MISMATCH",
+                                "Security rejection: APK package '${packageInfo.packageName}' does not match installed application '$packageName'",
+                                null
+                            )
+                            return@setMethodCallHandler
+                        }
+
+                        // Create Content URI via FileProvider
+                        val apkUri = FileProvider.getUriForFile(
+                            this,
+                            "$packageName.fileprovider",
+                            apkFile
+                        )
+
+                        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(apkUri, "application/vnd.android.package-archive")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+
+                        startActivity(installIntent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("INSTALL_FAILED", e.message, null)
+                    }
+                }
+                "isNetworkUnmetered" -> {
+                    try {
+                        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                        val network = cm.activeNetwork
+                        val capabilities = cm.getNetworkCapabilities(network)
+                        val isUnmetered = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
+                        result.success(isUnmetered)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 }
+

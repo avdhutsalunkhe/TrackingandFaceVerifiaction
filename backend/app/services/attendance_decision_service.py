@@ -29,7 +29,6 @@ class AttendanceDecisionService:
     """
 
     @staticmethod
-    @staticmethod
     def evaluate_attendance(
         db: Session,
         user: User,

@@ -1,245 +1,639 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:open_filex/open_filex.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../config/api_config.dart';
 import '../../network/api_client.dart';
+import '../../widgets/update/free_fire_patch_hud.dart';
+import 'device_service.dart';
 import 'notification_service.dart';
+import 'patch_manager.dart';
 
-class UpdateInfo {
-  final String version;
-  final int versionCode;
-  final String apkUrl;
-  final bool forceUpdate;
-  final int minimumSupportedVersionCode;
+/// Data model representing the dynamic update policy resolved from the backend.
+class AppUpdatePolicyInfo {
+  final bool hasUpdate;
+  final String platform;
+  final String distributionChannel; // direct_apk, google_play, all
+  final String updateType; // resource_patch, direct_apk, in_app_play
+  final String latestVersion;
+  final int latestVersionCode;
+  final int minSupportedVersionCode;
+  final bool isMandatory;
+  final String downloadUrl;
+  final String? patchManifestUrl;
+  final int fileSizeBytes;
+  final double fileSizeMb;
+  final String? sha256Hash;
+  final String releaseTitle;
   final List<String> releaseNotes;
-  final String? sha256;
+  final Map<String, dynamic>? metadata;
 
-  UpdateInfo({
-    required this.version,
-    required this.versionCode,
-    required this.apkUrl,
-    this.forceUpdate = false,
-    this.minimumSupportedVersionCode = 1,
-    this.releaseNotes = const [],
-    this.sha256,
+  AppUpdatePolicyInfo({
+    required this.hasUpdate,
+    required this.platform,
+    required this.distributionChannel,
+    required this.updateType,
+    required this.latestVersion,
+    required this.latestVersionCode,
+    required this.minSupportedVersionCode,
+    required this.isMandatory,
+    required this.downloadUrl,
+    this.patchManifestUrl,
+    required this.fileSizeBytes,
+    required this.fileSizeMb,
+    this.sha256Hash,
+    required this.releaseTitle,
+    required this.releaseNotes,
+    this.metadata,
   });
 
-  factory UpdateInfo.fromJson(Map<String, dynamic> json, {String? baseUrl}) {
-    String rawApkUrl = json['apkUrl'] as String? ?? json['apk_url'] as String? ?? '';
-    if (rawApkUrl.isNotEmpty && !rawApkUrl.startsWith('http://') && !rawApkUrl.startsWith('https://') && baseUrl != null) {
+  factory AppUpdatePolicyInfo.fromJson(Map<String, dynamic> json, {String? baseUrl}) {
+    String rawDownloadUrl = json['download_url'] as String? ?? json['downloadUrl'] as String? ?? json['apkUrl'] as String? ?? '';
+    if (rawDownloadUrl.isNotEmpty &&
+        !rawDownloadUrl.startsWith('http://') &&
+        !rawDownloadUrl.startsWith('https://') &&
+        baseUrl != null &&
+        baseUrl.isNotEmpty) {
       final cleanBase = baseUrl.replaceAll(RegExp(r'/+$'), '');
-      final cleanPath = rawApkUrl.startsWith('/') ? rawApkUrl : '/$rawApkUrl';
-      rawApkUrl = '$cleanBase$cleanPath';
+      final cleanPath = rawDownloadUrl.startsWith('/') ? rawDownloadUrl : '/$rawDownloadUrl';
+      rawDownloadUrl = '$cleanBase$cleanPath';
     }
 
-    return UpdateInfo(
-      version: json['version'] as String? ?? '1.0.0',
-      versionCode: json['versionCode'] as int? ?? json['version_code'] as int? ?? 1,
-      apkUrl: rawApkUrl,
-      forceUpdate: json['forceUpdate'] as bool? ?? json['force_update'] as bool? ?? false,
-      minimumSupportedVersionCode: json['minimumSupportedVersionCode'] as int? ?? json['min_version_code'] as int? ?? 1,
-      releaseNotes: (json['releaseNotes'] as List<dynamic>? ?? json['release_notes'] as List<dynamic>?)
-              ?.map((e) => e.toString())
-              .toList() ??
-          [],
-      sha256: json['sha256'] as String?,
+    final rawBytes = json['file_size_bytes'] as int? ?? json['fileSizeBytes'] as int? ?? 0;
+    final rawMb = (json['file_size_mb'] as num?)?.toDouble() ?? (rawBytes > 0 ? rawBytes / (1024 * 1024) : 0.0);
+
+    final rawNotes = json['release_notes'] as List<dynamic>? ?? json['releaseNotes'] as List<dynamic>?;
+    final notes = rawNotes?.map((e) => e.toString()).toList() ?? [];
+
+    return AppUpdatePolicyInfo(
+      hasUpdate: json['has_update'] as bool? ?? json['hasUpdate'] as bool? ?? false,
+      platform: json['platform'] as String? ?? 'android',
+      distributionChannel: json['distribution_channel'] as String? ?? json['distributionChannel'] as String? ?? 'direct_apk',
+      updateType: json['update_type'] as String? ?? json['updateType'] as String? ?? 'direct_apk',
+      latestVersion: json['latest_version'] as String? ?? json['version'] as String? ?? '1.0.0',
+      latestVersionCode: json['latest_version_code'] as int? ?? json['versionCode'] as int? ?? 1,
+      minSupportedVersionCode: json['min_supported_version_code'] as int? ?? json['minimumSupportedVersionCode'] as int? ?? 1,
+      isMandatory: json['is_mandatory'] as bool? ?? json['forceUpdate'] as bool? ?? false,
+      downloadUrl: rawDownloadUrl,
+      patchManifestUrl: json['patch_manifest_url'] as String?,
+      fileSizeBytes: rawBytes,
+      fileSizeMb: rawMb,
+      sha256Hash: json['sha256_hash'] as String? ?? json['sha256'] as String?,
+      releaseTitle: json['release_title'] as String? ?? json['releaseTitle'] as String? ?? 'System Update Available',
+      releaseNotes: notes,
+      metadata: json['metadata'] as Map<String, dynamic>?,
     );
   }
 }
 
+/// Senior engineer enterprise update system supporting:
+/// - Developer-controlled dynamic backend policies (no hardcoded versions)
+/// - Silent resource patches without APK reinstall
+/// - Resumable HTTP 206 chunked APK downloads with SHA-256 verification
+/// - Dual distribution (Google Play vs Direct APK)
+/// - Background automatic periodic checks
+/// - Free Fire MAX high-tech HUD dialog
 class AppUpdateService {
   static final AppUpdateService instance = AppUpdateService._internal();
   AppUpdateService._internal();
 
-  /// Session cache for dismissed version code so the dialog does not repeatedly harass users
+  static const MethodChannel _updateChannel = MethodChannel('com.fieldstaff.attendance/app_update');
+
+  /// Session memory for dismissed version codes so non-mandatory updates don't harass users
   static int? _dismissedVersionCode;
 
+  /// Lock to prevent multiple concurrent update checks/downloads
+  static bool _isCheckingOrUpdating = false;
+
+  /// Periodic background timer
+  Timer? _backgroundTimer;
+
+  /// Start automatic background update checker respecting Android background restrictions
+  void startPeriodicBackgroundCheck({Duration interval = const Duration(hours: 6)}) {
+    _backgroundTimer?.cancel();
+    _backgroundTimer = Timer.periodic(interval, (_) {
+      _runSilentBackgroundUpdateCheck();
+    });
+    // Trigger initial silent check after 30 seconds of app start
+    Future.delayed(const Duration(seconds: 30), () {
+      _runSilentBackgroundUpdateCheck();
+    });
+  }
+
+  /// Silent background check (does not show UI unless pre-downloaded APK is ready to install)
+  Future<void> _runSilentBackgroundUpdateCheck() async {
+    if (kIsWeb || !Platform.isAndroid || _isCheckingOrUpdating) return;
+
+    try {
+      final policy = await _fetchPolicyFromServer();
+      if (policy == null || !policy.hasUpdate) return;
+
+      final packageInfo = await PackageInfo.fromPlatform();
+      final currentBuildNumber = int.tryParse(packageInfo.buildNumber) ?? 1;
+
+      if (policy.latestVersionCode <= currentBuildNumber) return;
+
+      // 1. Silent Resource Patch Handling
+      if (policy.updateType == 'resource_patch') {
+        debugPrint('[AppUpdateService] Background silent resource patch detected: v${policy.latestVersion}');
+        await _downloadAndApplyResourcePatch(policy, null, null, null);
+        return;
+      }
+
+      // 2. Full APK Pre-download on unmetered network (WiFi)
+      final isUnmetered = await isNetworkUnmetered();
+      if (isUnmetered && !policy.isMandatory) {
+        debugPrint('[AppUpdateService] Unmetered network available. Background pre-downloading APK...');
+        final tempDir = await getTemporaryDirectory();
+        final apkFile = File('${tempDir.path}/app-update.apk');
+        final downloaded = await _downloadApkWithResume(
+          policy: policy,
+          targetFile: apkFile,
+          progressNotifier: ValueNotifier<double>(0.0),
+          speedNotifier: ValueNotifier<String>(''),
+          errorNotifier: ValueNotifier<String>(''),
+        );
+
+        if (downloaded) {
+          // Notify user that update is ready to install instantly
+          await NotificationService.instance.showNotification(
+            id: 9994,
+            title: 'FieldStaff Update Ready',
+            body: 'Version ${policy.latestVersion} is downloaded. Tap to update.',
+            category: 'UPDATE',
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('[AppUpdateService] Silent background check skipped: $e');
+    }
+  }
+
+  /// Main public update check invoked on UI startup or user button click
   Future<void> checkForUpdates(BuildContext context, {bool showNoUpdateNotice = false}) async {
-    // 1. Never show APK update prompt on Web or non-Android platforms
     if (kIsWeb || !Platform.isAndroid) {
       if (showNoUpdateNotice && context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('App is up to date.')),
+          const SnackBar(content: Text('App is up to date (Web / Unsupported OS).')),
         );
       }
       return;
     }
 
+    if (_isCheckingOrUpdating) return;
+    _isCheckingOrUpdating = true;
+
     try {
-      final baseUrl = ApiClient().baseUrl.replaceAll(RegExp(r'/+$'), '');
-      // Try active backend baseUrl first, followed by configured public/LAN backend candidates
-      final candidateUrls = {
-        if (baseUrl.isNotEmpty) '$baseUrl/api/app/latest-release',
-        for (final host in ApiConfig.effectiveCandidates)
-          '${host.replaceAll(RegExp(r'/+$'), '')}/api/app/latest-release',
-      }.toList();
+      final policy = await _fetchPolicyFromServer();
+      final packageInfo = await PackageInfo.fromPlatform();
+      final currentBuildNumber = int.tryParse(packageInfo.buildNumber) ?? 1;
+      final currentVersionName = packageInfo.version;
 
-      http.Response? response;
-      for (final url in candidateUrls) {
-        try {
-          final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
-          if (res.statusCode == 200) {
-            response = res;
-            break;
-          }
-        } catch (_) {}
-      }
-
-      if (response == null || response.statusCode != 200) {
+      if (policy == null || policy.latestVersionCode <= currentBuildNumber) {
+        _isCheckingOrUpdating = false;
         if (showNoUpdateNotice && context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('App is up to date.')),
+            SnackBar(content: Text('App is up to date (v$currentVersionName Build $currentBuildNumber).')),
           );
         }
         return;
       }
 
-      final data = json.decode(response.body) as Map<String, dynamic>;
-      final updateInfo = UpdateInfo.fromJson(data, baseUrl: baseUrl);
+      // Check dismissed cache for optional updates
+      if (!policy.isMandatory && _dismissedVersionCode == policy.latestVersionCode && !showNoUpdateNotice) {
+        _isCheckingOrUpdating = false;
+        return;
+      }
 
-      final packageInfo = await PackageInfo.fromPlatform();
-      final currentBuildNumber = int.tryParse(packageInfo.buildNumber) ?? 1;
+      // Record telemetry check
+      _logTelemetry(
+        targetPolicy: policy,
+        currentVersionCode: currentBuildNumber,
+        currentVersion: currentVersionName,
+        status: 'CHECKED',
+      );
 
-      if (updateInfo.versionCode > currentBuildNumber && context.mounted) {
-        // If user already tapped "Later" for this version in the current session, don't re-prompt automatically
-        if (!updateInfo.forceUpdate && _dismissedVersionCode == updateInfo.versionCode && !showNoUpdateNotice) {
-          return;
-        }
-
-        // Record notification in local notification center
-        await NotificationService.instance.showNotification(
-          id: 9993,
-          title: 'Update Available (v${updateInfo.version})',
-          body: 'A new version with performance & tracking updates is ready.',
-          category: 'UPDATE',
-        );
-        _showUpdateDialog(context, updateInfo);
-      } else if (showNoUpdateNotice && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('App is up to date (Latest Version).')),
-        );
+      // Present Free Fire MAX style update HUD
+      if (context.mounted) {
+        _showFreeFireUpdateDialog(context, policy, currentVersionName, currentBuildNumber);
       }
     } catch (e) {
-      debugPrint('[AppUpdateService] Update check skipped: $e');
+      debugPrint('[AppUpdateService] Check updates error: $e');
+    } finally {
+      _isCheckingOrUpdating = false;
     }
   }
 
-  void _showUpdateDialog(BuildContext context, UpdateInfo update) {
+  /// Fetch dynamic update policy from backend with failover support
+  Future<AppUpdatePolicyInfo?> _fetchPolicyFromServer() async {
+    final channel = await getDistributionChannel();
+    final packageInfo = await PackageInfo.fromPlatform();
+    final currentBuild = int.tryParse(packageInfo.buildNumber) ?? 1;
+    final currentVer = packageInfo.version;
+    final deviceId = await DeviceService.instance.getDeviceId();
+
+    final queryParams = 'platform=android&channel=$channel&version_code=$currentBuild&version_name=$currentVer&device_id=$deviceId';
+
+    final activeBaseUrl = ApiClient().baseUrl.replaceAll(RegExp(r'/+$'), '');
+    final candidateUrls = {
+      if (activeBaseUrl.isNotEmpty) '$activeBaseUrl/api/app/update-policy?$queryParams',
+      for (final host in ApiConfig.effectiveCandidates)
+        '${host.replaceAll(RegExp(r'/+$'), '')}/api/app/update-policy?$queryParams',
+      // Fallback endpoint
+      if (activeBaseUrl.isNotEmpty) '$activeBaseUrl/api/app/latest-release?channel=$channel',
+      for (final host in ApiConfig.effectiveCandidates)
+        '${host.replaceAll(RegExp(r'/+$'), '')}/api/app/latest-release?channel=$channel',
+    }.toList();
+
+    for (final url in candidateUrls) {
+      try {
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
+        if (res.statusCode == 200) {
+          final data = json.decode(res.body) as Map<String, dynamic>;
+          final parsed = AppUpdatePolicyInfo.fromJson(data, baseUrl: activeBaseUrl);
+          return parsed;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  /// Show Free Fire MAX style tactical HUD dialog
+  void _showFreeFireUpdateDialog(
+    BuildContext context,
+    AppUpdatePolicyInfo policy,
+    String currentVersion,
+    int currentBuildNumber,
+  ) {
+    final progressNotifier = ValueNotifier<double>(0.0);
+    final statusNotifier = ValueNotifier<UpdateHudStatus>(UpdateHudStatus.idle);
+    final speedNotifier = ValueNotifier<String>('');
+    final errorNotifier = ValueNotifier<String>('');
+
     showDialog(
       context: context,
-      barrierDismissible: !update.forceUpdate,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Text('App Update Available (v${update.version})'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('A new version of FieldStaff Attendance is ready for installation:'),
-            if (update.releaseNotes.isNotEmpty) ...[
-              const SizedBox(height: 10),
-              ...update.releaseNotes.map((note) => Padding(
-                    padding: const EdgeInsets.only(bottom: 4),
-                    child: Text('• $note', style: const TextStyle(fontSize: 13)),
-                  )),
-            ],
-          ],
-        ),
-        actions: [
-          if (!update.forceUpdate)
-            TextButton(
-              onPressed: () {
-                _dismissedVersionCode = update.versionCode;
-                Navigator.pop(ctx);
-              },
-              child: const Text('Later'),
-            ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF0369A1),
-              foregroundColor: Colors.white,
-            ),
-            onPressed: () {
-              Navigator.pop(ctx);
-              _downloadAndInstallApk(context, update);
-            },
-            child: const Text('Update Now'),
-          ),
-        ],
-      ),
+      barrierDismissible: !policy.isMandatory,
+      barrierColor: Colors.black.withOpacity(0.85),
+      builder: (dialogCtx) {
+        return FreeFirePatchHud(
+          currentVersion: 'v$currentVersion (B$currentBuildNumber)',
+          targetVersion: policy.latestVersion,
+          targetVersionCode: policy.latestVersionCode,
+          updateType: policy.updateType,
+          fileSizeMb: policy.fileSizeMb,
+          releaseNotes: policy.releaseNotes,
+          isMandatory: policy.isMandatory,
+          releaseTitle: policy.releaseTitle,
+          progressNotifier: progressNotifier,
+          statusNotifier: statusNotifier,
+          speedNotifier: speedNotifier,
+          errorNotifier: errorNotifier,
+          onDismiss: () {
+            _dismissedVersionCode = policy.latestVersionCode;
+            Navigator.of(dialogCtx, rootNavigator: true).pop();
+            _logTelemetry(
+              targetPolicy: policy,
+              currentVersionCode: currentBuildNumber,
+              currentVersion: currentVersion,
+              status: 'DISMISSED',
+            );
+          },
+          onRetry: () {
+            statusNotifier.value = UpdateHudStatus.idle;
+            errorNotifier.value = '';
+            _executeFlow(dialogCtx, policy, progressNotifier, statusNotifier, speedNotifier, errorNotifier, currentVersion, currentBuildNumber);
+          },
+          onStartUpdate: () {
+            _executeFlow(dialogCtx, policy, progressNotifier, statusNotifier, speedNotifier, errorNotifier, currentVersion, currentBuildNumber);
+          },
+        );
+      },
     );
   }
 
-  Future<void> _downloadAndInstallApk(BuildContext context, UpdateInfo update) async {
-    final progressNotifier = ValueNotifier<double>(0.0);
+  /// Orchestrate patch vs APK installation execution
+  Future<void> _executeFlow(
+    BuildContext dialogCtx,
+    AppUpdatePolicyInfo policy,
+    ValueNotifier<double> progressNotifier,
+    ValueNotifier<UpdateHudStatus> statusNotifier,
+    ValueNotifier<String> speedNotifier,
+    ValueNotifier<String> errorNotifier,
+    String currentVersion,
+    int currentBuildNumber,
+  ) async {
+    // 1. Silent Resource Patch Flow
+    if (policy.updateType == 'resource_patch') {
+      statusNotifier.value = UpdateHudStatus.downloading;
+      final success = await _downloadAndApplyResourcePatch(policy, progressNotifier, speedNotifier, errorNotifier);
+      if (success) {
+        statusNotifier.value = UpdateHudStatus.appliedSilent;
+        _logTelemetry(
+          targetPolicy: policy,
+          currentVersionCode: currentBuildNumber,
+          currentVersion: currentVersion,
+          status: 'APPLIED',
+        );
+        await Future.delayed(const Duration(milliseconds: 1600));
+        if (dialogCtx.mounted) {
+          Navigator.of(dialogCtx, rootNavigator: true).pop();
+        }
+      } else {
+        statusNotifier.value = UpdateHudStatus.failed;
+      }
+      return;
+    }
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Downloading Update...'),
-        content: ValueListenableBuilder<double>(
-          valueListenable: progressNotifier,
-          builder: (_, prog, __) => Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              LinearProgressIndicator(value: prog > 0 ? prog : null),
-              const SizedBox(height: 12),
-              Text('${(prog * 100).toStringAsFixed(0)}% Completed'),
-            ],
-          ),
-        ),
-      ),
+    // 2. Direct APK Flow
+    statusNotifier.value = UpdateHudStatus.downloading;
+    final tempDir = await getTemporaryDirectory();
+    final apkFile = File('${tempDir.path}/app-update.apk');
+
+    final downloaded = await _downloadApkWithResume(
+      policy: policy,
+      targetFile: apkFile,
+      progressNotifier: progressNotifier,
+      speedNotifier: speedNotifier,
+      errorNotifier: errorNotifier,
     );
+
+    if (!downloaded) {
+      statusNotifier.value = UpdateHudStatus.failed;
+      _logTelemetry(
+        targetPolicy: policy,
+        currentVersionCode: currentBuildNumber,
+        currentVersion: currentVersion,
+        status: 'FAILED',
+        errorMessage: errorNotifier.value,
+      );
+      return;
+    }
+
+    // 3. Verification & Package Installation
+    statusNotifier.value = UpdateHudStatus.verifying;
+    final verified = await _verifySha256(apkFile, policy.sha256Hash);
+    if (!verified) {
+      statusNotifier.value = UpdateHudStatus.failed;
+      errorNotifier.value = 'Integrity verification failed (SHA-256 mismatch).';
+      if (await apkFile.exists()) await apkFile.delete();
+      _logTelemetry(
+        targetPolicy: policy,
+        currentVersionCode: currentBuildNumber,
+        currentVersion: currentVersion,
+        status: 'FAILED',
+        errorMessage: 'SHA-256 verification failed',
+      );
+      return;
+    }
+
+    statusNotifier.value = UpdateHudStatus.readyToInstall;
+    _logTelemetry(
+      targetPolicy: policy,
+      currentVersionCode: currentBuildNumber,
+      currentVersion: currentVersion,
+      status: 'DOWNLOADED',
+    );
+
+    // Launch package installer via native FileProvider intent
+    final installed = await launchApkInstaller(apkFile.path);
+    if (installed) {
+      _logTelemetry(
+        targetPolicy: policy,
+        currentVersionCode: currentBuildNumber,
+        currentVersion: currentVersion,
+        status: 'INSTALLED',
+      );
+    } else {
+      statusNotifier.value = UpdateHudStatus.failed;
+      errorNotifier.value = 'Package installation failed or permission denied.';
+    }
+  }
+
+  /// Download and apply small silent resource patch
+  Future<bool> _downloadAndApplyResourcePatch(
+    AppUpdatePolicyInfo policy,
+    ValueNotifier<double>? progressNotifier,
+    ValueNotifier<String>? speedNotifier,
+    ValueNotifier<String>? errorNotifier,
+  ) async {
+    try {
+      final patchUrl = policy.patchManifestUrl ?? policy.downloadUrl;
+      final response = await http.get(Uri.parse(patchUrl)).timeout(const Duration(seconds: 25));
+      if (response.statusCode != 200) {
+        errorNotifier?.value = 'HTTP ${response.statusCode}: Failed to fetch resource patch.';
+        return false;
+      }
+
+      final bytes = response.bodyBytes;
+      if (policy.sha256Hash != null && policy.sha256Hash!.isNotEmpty) {
+        final computed = sha256.convert(bytes).toString();
+        if (computed.toLowerCase() != policy.sha256Hash!.toLowerCase()) {
+          errorNotifier?.value = 'Patch hash verification mismatch.';
+          return false;
+        }
+      }
+
+      final applied = await PatchManager.instance.applyResourcePatch(
+        patchId: 'v${policy.latestVersionCode}',
+        patchVersionCode: policy.latestVersionCode,
+        versionString: policy.latestVersion,
+        patchBytes: bytes,
+        expectedSha256: policy.sha256Hash ?? '',
+        metadata: policy.metadata,
+      );
+
+      return applied;
+    } catch (e) {
+      errorNotifier?.value = 'Patch error: $e';
+      return false;
+    }
+  }
+
+  /// Resumable HTTP 206 chunked APK downloader with speed tracking
+  Future<bool> _downloadApkWithResume({
+    required AppUpdatePolicyInfo policy,
+    required File targetFile,
+    required ValueNotifier<double> progressNotifier,
+    required ValueNotifier<String> speedNotifier,
+    required ValueNotifier<String> errorNotifier,
+  }) async {
+    final partFile = File('${targetFile.path}.part');
+    final stopwatch = Stopwatch()..start();
 
     try {
-      final client = http.Client();
-      final request = http.Request('GET', Uri.parse(update.apkUrl));
-      final response = await client.send(request);
+      int existingBytes = 0;
+      if (await partFile.exists()) {
+        existingBytes = await partFile.length();
+      }
 
-      final totalBytes = response.contentLength ?? 0;
-      int receivedBytes = 0;
-      final bytes = <int>[];
+      final client = http.Client();
+      final request = http.Request('GET', Uri.parse(policy.downloadUrl));
+
+      if (existingBytes > 0) {
+        request.headers['Range'] = 'bytes=$existingBytes-';
+        debugPrint('[AppUpdateService] Resuming download from byte $existingBytes...');
+      }
+
+      final response = await client.send(request);
+      final isPartial = response.statusCode == 206;
+      final isFull = response.statusCode == 200;
+
+      if (!isPartial && !isFull) {
+        errorNotifier.value = 'Server returned HTTP ${response.statusCode}';
+        return false;
+      }
+
+      IOSink sink;
+      if (isPartial) {
+        sink = partFile.openWrite(mode: FileMode.append);
+      } else {
+        existingBytes = 0;
+        sink = partFile.openWrite(mode: FileMode.write);
+      }
+
+      final totalBytes = (response.contentLength ?? 0) + existingBytes;
+      int receivedBytes = existingBytes;
+      int speedWindowBytes = 0;
+      int lastSpeedCheckMs = stopwatch.elapsedMilliseconds;
 
       await for (final chunk in response.stream) {
-        bytes.addAll(chunk);
+        sink.add(chunk);
         receivedBytes += chunk.length;
+        speedWindowBytes += chunk.length;
+
         if (totalBytes > 0) {
-          progressNotifier.value = receivedBytes / totalBytes;
+          progressNotifier.value = (receivedBytes / totalBytes).clamp(0.0, 1.0);
+        }
+
+        final nowMs = stopwatch.elapsedMilliseconds;
+        if (nowMs - lastSpeedCheckMs >= 600) {
+          final elapsedSec = (nowMs - lastSpeedCheckMs) / 1000.0;
+          final speedMb = (speedWindowBytes / (1024 * 1024)) / elapsedSec;
+          speedNotifier.value = '${speedMb.toStringAsFixed(1)} MB/s';
+          speedWindowBytes = 0;
+          lastSpeedCheckMs = nowMs;
         }
       }
 
-      // Checksum verification
-      if (update.sha256 != null && update.sha256!.isNotEmpty) {
-        final calculatedHash = sha256.convert(bytes).toString();
-        if (calculatedHash.toLowerCase() != update.sha256!.toLowerCase()) {
-          throw Exception('APK SHA-256 verification failed.');
-        }
-      }
+      await sink.flush();
+      await sink.close();
 
-      // Save to temporary cache directory
-      final tempDir = await getTemporaryDirectory();
-      final apkFile = File('${tempDir.path}/app-update.apk');
-      await apkFile.writeAsBytes(bytes);
+      // Rename .part to target APK
+      if (await targetFile.exists()) await targetFile.delete();
+      await partFile.rename(targetFile.path);
 
-      if (context.mounted) Navigator.pop(context);
-
-      // Trigger system package installer
-      await OpenFilex.open(apkFile.path);
+      debugPrint('[AppUpdateService] APK download completed: ${targetFile.path} ($receivedBytes bytes)');
+      return true;
     } catch (e) {
-      if (context.mounted) {
-        Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update failed: $e'), backgroundColor: Colors.red),
-        );
-      }
+      errorNotifier.value = 'Download interrupted: $e';
+      return false;
+    } finally {
+      stopwatch.stop();
     }
+  }
+
+  /// Strict SHA-256 file checksum verification
+  Future<bool> _verifySha256(File file, String? expectedHash) async {
+    if (expectedHash == null || expectedHash.isEmpty) return true;
+    try {
+      final digest = await sha256.bind(file.openRead()).first;
+      final calculated = digest.toString().toLowerCase();
+      final expected = expectedHash.trim().toLowerCase();
+      final matches = calculated == expected;
+      if (!matches) {
+        debugPrint('[AppUpdateService] SHA-256 verification failed! Calculated: $calculated, Expected: $expected');
+      }
+      return matches;
+    } catch (e) {
+      debugPrint('[AppUpdateService] SHA-256 computation error: $e');
+      return false;
+    }
+  }
+
+  /// Launch system PackageInstaller via Android Native Channel and FileProvider
+  Future<bool> launchApkInstaller(String apkPath) async {
+    try {
+      final bool? result = await _updateChannel.invokeMethod<bool>('installApk', {
+        'filePath': apkPath,
+      });
+      return result ?? false;
+    } on PlatformException catch (e) {
+      debugPrint('[AppUpdateService] Native install error: ${e.code} - ${e.message}');
+      if (e.code == 'PERMISSION_DENIED') {
+        await _updateChannel.invokeMethod('openInstallPermissionSettings');
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[AppUpdateService] General install invocation error: $e');
+      return false;
+    }
+  }
+
+  /// Get installer distribution source (e.g. google_play or direct_apk)
+  Future<String> getDistributionChannel() async {
+    if (!Platform.isAndroid) return 'direct_apk';
+    try {
+      final String? channel = await _updateChannel.invokeMethod<String>('getDistributionChannel');
+      return channel ?? 'direct_apk';
+    } catch (_) {
+      return 'direct_apk';
+    }
+  }
+
+  /// Check whether active connection is unmetered (WiFi or unlimited cellular)
+  Future<bool> isNetworkUnmetered() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final bool? unmetered = await _updateChannel.invokeMethod<bool>('isNetworkUnmetered');
+      return unmetered ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Send telemetry event to backend asynchronously
+  void _logTelemetry({
+    required AppUpdatePolicyInfo targetPolicy,
+    required int currentVersionCode,
+    required String currentVersion,
+    required String status,
+    String? errorMessage,
+    int? bytesDownloaded,
+  }) async {
+    try {
+      final deviceId = await DeviceService.instance.getDeviceId();
+      final prefs = await SharedPreferences.getInstance();
+      final userId = prefs.getInt('user_id');
+
+      final activeBaseUrl = ApiClient().baseUrl.replaceAll(RegExp(r'/+$'), '');
+      if (activeBaseUrl.isEmpty) return;
+
+      final payload = {
+        'device_id': deviceId,
+        'user_id': userId,
+        'current_version': currentVersion,
+        'current_version_code': currentVersionCode,
+        'target_version': targetPolicy.latestVersion,
+        'target_version_code': targetPolicy.latestVersionCode,
+        'update_type': targetPolicy.updateType,
+        'status': status,
+        'bytes_downloaded': bytesDownloaded ?? targetPolicy.fileSizeBytes,
+        'error_message': errorMessage,
+      };
+
+      http.post(
+        Uri.parse('$activeBaseUrl/api/app/telemetry/update-log'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode(payload),
+      ).timeout(const Duration(seconds: 4)).ignore();
+    } catch (_) {}
   }
 }

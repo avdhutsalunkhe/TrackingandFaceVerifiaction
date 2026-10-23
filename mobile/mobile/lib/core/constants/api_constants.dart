@@ -12,6 +12,7 @@ class ApiConstants {
   
   // Auth endpoints
   static const String login = '/api/auth/login';
+  static const String refresh = '/api/auth/refresh';
   static const String changePassword = '/api/auth/change-password';
   static const String me = '/api/auth/me';
 

@@ -1,15 +1,20 @@
 {
   "app_name": "fieldstaff_attendance",
-  "version": "1.0.3",
-  "versionCode": 4,
-  "build_number": "4",
+  "version": "1.0.4",
+  "versionCode": 5,
+  "build_number": "5",
   "package_name": "fieldstaff_attendance",
   "forceUpdate": false,
   "minimumSupportedVersionCode": 1,
   "apkUrl": "/api/app/download-apk",
+  "apk_filename": "fieldstaff-attendance-universal-release.apk",
+  "file_size_bytes": 64425847,
+  "sha256": "0944829621483205B63B7F12DF7CA23BD4D28B28799806ED1FA1B90795FB0260",
   "releaseNotes": [
-    "Mobile admin login enabled strictly for employee face registration",
-    "Dedicated mobile face enrollment dashboard with real-time employee search",
-    "Optimized biometric verification latency and GPS tracking reliability"
+    "Offline binary selfie attendance with interactive telemetry toggle (YES / NO)",
+    "SQLite3 binary BLOB storage for seamless offline punch requests during server/network downtime",
+    "Automatic shift-based GPS duty journey tracking and batch route synchronization",
+    "Android 12+ watchdog receiver ensuring continuous background tracking across app swipe from Recents",
+    "Monotonic sequence number preservation and transactional synced coordinate purge"
   ]
 }

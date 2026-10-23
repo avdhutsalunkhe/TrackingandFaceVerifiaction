@@ -214,6 +214,23 @@ def run_auto_migrations(target_engine):
             except Exception as ex:
                 print(f"[AutoMigration] Failed creating extra_work_requests: {ex}")
 
+        # Automatic Patch Update System Tables
+        if "app_update_policies" not in tables:
+            try:
+                from app.models.app_update import AppUpdatePolicy
+                AppUpdatePolicy.__table__.create(target_engine, checkfirst=True)
+                print("[AutoMigration] Created app_update_policies table")
+            except Exception as ex:
+                print(f"[AutoMigration] Failed creating app_update_policies: {ex}")
+
+        if "app_update_logs" not in tables:
+            try:
+                from app.models.app_update import AppUpdateLog
+                AppUpdateLog.__table__.create(target_engine, checkfirst=True)
+                print("[AutoMigration] Created app_update_logs table")
+            except Exception as ex:
+                print(f"[AutoMigration] Failed creating app_update_logs: {ex}")
+
         try:
             with target_engine.begin() as conn:
                 role_count = conn.execute(text("SELECT COUNT(*) FROM role_masters")).scalar()

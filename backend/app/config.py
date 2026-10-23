@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "fieldstaff_super_secret_jwt_key_change_in_production_2026_xyz"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     # ML Weights & Model Names
     ML_WEIGHTS_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights")

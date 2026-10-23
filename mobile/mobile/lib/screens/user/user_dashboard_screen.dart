@@ -423,13 +423,26 @@ class _UserDashboardScreenState extends State<UserDashboardScreen> {
     } catch (e) {
       setState(() => _isCheckingLocation = false);
       if (!mounted) return;
+      if (e is ApiException) {
+        if (e.isUnauthorized) {
+          ApiClient.onSessionExpired?.call();
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(e.userFriendlyMessage),
+            backgroundColor: AppColors.error,
+          ),
+        );
+        return;
+      }
       final errStr = e.toString().replaceFirst('Exception: ', '');
       if (errStr.contains('Permission')) {
         await LocationPermissionDialog.show(context);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Unable to verify attendance. Please try again.'),
+          SnackBar(
+            content: Text(errStr.isNotEmpty ? errStr : 'Unable to verify attendance. Please try again.'),
             backgroundColor: AppColors.error,
           ),
         );

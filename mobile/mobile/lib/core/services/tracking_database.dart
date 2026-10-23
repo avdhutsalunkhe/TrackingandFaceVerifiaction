@@ -17,11 +17,13 @@ class TrackingDatabase {
   final List<Map<String, dynamic>> _webOfflineChunks = [];
   final List<Map<String, dynamic>> _webOfflineInterruptionEvents = [];
   final List<Map<String, dynamic>> _webNotifications = [];
+  final List<Map<String, dynamic>> _webOfflineAttendanceRequests = [];
   int _webSessionSeq = 1;
   int _webNotifSeq = 1;
   int _webPointSeq = 1;
   int _webChunkSeq = 1;
   int _webEventSeq = 1;
+  int _webRequestSeq = 1;
 
   bool isTestMode = false;
   bool get _useMemoryFallback => kIsWeb || isTestMode;
@@ -39,7 +41,7 @@ class TrackingDatabase {
 
     return await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: (db, version) async {
         // Table for tracking sessions created offline (1 summary row per session)
         await db.execute("""
@@ -146,6 +148,30 @@ class TrackingDatabase {
           )
         """);
         await db.execute('CREATE INDEX idx_offline_events_session ON offline_interruption_events (session_uuid, detected_at)');
+
+        // Table for durable offline selfie attendance requests (storing raw image BLOB)
+        await db.execute("""
+          CREATE TABLE offline_attendance_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_request_id TEXT NOT NULL UNIQUE,
+            user_id INTEGER,
+            employee_id TEXT,
+            latitude REAL,
+            longitude REAL,
+            accuracy REAL,
+            location_name TEXT,
+            reason TEXT,
+            verification_no INTEGER,
+            include_data INTEGER NOT NULL DEFAULT 1,
+            device_timestamp TEXT NOT NULL,
+            image_blob BLOB NOT NULL,
+            sync_status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TEXT NOT NULL,
+            synced_at TEXT,
+            error_message TEXT
+          )
+        """);
+        await db.execute('CREATE INDEX idx_offline_att_req_sync ON offline_attendance_requests (sync_status)');
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -237,6 +263,32 @@ class TrackingDatabase {
             )
           """);
           await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_events_session ON offline_interruption_events (session_uuid, detected_at)');
+        }
+
+        if (oldVersion < 5) {
+          // Version 5: Offline Selfie Attendance Requests (Binary image_blob storage)
+          await db.execute("""
+            CREATE TABLE IF NOT EXISTS offline_attendance_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              client_request_id TEXT NOT NULL UNIQUE,
+              user_id INTEGER,
+              employee_id TEXT,
+              latitude REAL,
+              longitude REAL,
+              accuracy REAL,
+              location_name TEXT,
+              reason TEXT,
+              verification_no INTEGER,
+              include_data INTEGER NOT NULL DEFAULT 1,
+              device_timestamp TEXT NOT NULL,
+              image_blob BLOB NOT NULL,
+              sync_status TEXT NOT NULL DEFAULT 'PENDING',
+              created_at TEXT NOT NULL,
+              synced_at TEXT,
+              error_message TEXT
+            )
+          """);
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_offline_att_req_sync ON offline_attendance_requests (sync_status)');
         }
       },
     );
@@ -1127,5 +1179,118 @@ class TrackingDatabase {
       limit: 1,
     );
     return res.isNotEmpty ? res.first : null;
+  }
+
+  // --- Offline Selfie Attendance Requests (Binary BLOB Storage) ---
+
+  Future<int> queueOfflineAttendanceRequest(Map<String, dynamic> row) async {
+    if (_useMemoryFallback) {
+      final id = _webRequestSeq++;
+      final entry = Map<String, dynamic>.from(row);
+      entry['id'] = id;
+      _webOfflineAttendanceRequests.add(entry);
+      return id;
+    }
+    final db = await database;
+    if (db == null) return 0;
+    return await db.insert(
+      'offline_attendance_requests',
+      row,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getPendingAttendanceRequests([int? limit]) async {
+    if (_useMemoryFallback) {
+      var query = _webOfflineAttendanceRequests
+          .where((r) => r['sync_status'] == 'PENDING');
+      if (limit != null && limit > 0) {
+        return query.take(limit).toList();
+      }
+      return query.toList();
+    }
+    final db = await database;
+    if (db == null) return [];
+    return await db.query(
+      'offline_attendance_requests',
+      where: 'sync_status = ?',
+      whereArgs: ['PENDING'],
+      orderBy: 'created_at ASC',
+      limit: (limit != null && limit > 0) ? limit : null,
+    );
+  }
+
+  Future<void> markAttendanceRequestSynced(String clientRequestId, [int? serverId]) async {
+    final nowIso = DateTime.now().toIso8601String();
+    if (_useMemoryFallback) {
+      for (final r in _webOfflineAttendanceRequests) {
+        if (r['client_request_id'] == clientRequestId) {
+          r['sync_status'] = 'SYNCED';
+          r['synced_at'] = nowIso;
+        }
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    await db.update(
+      'offline_attendance_requests',
+      {
+        'sync_status': 'SYNCED',
+        'synced_at': nowIso,
+      },
+      where: 'client_request_id = ?',
+      whereArgs: [clientRequestId],
+    );
+  }
+
+  Future<void> markAttendanceRequestFailed(String clientRequestId, String errorMessage) async {
+    if (_useMemoryFallback) {
+      for (final r in _webOfflineAttendanceRequests) {
+        if (r['client_request_id'] == clientRequestId) {
+          r['sync_status'] = 'FAILED';
+          r['error_message'] = errorMessage;
+        }
+      }
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    await db.update(
+      'offline_attendance_requests',
+      {
+        'sync_status': 'FAILED',
+        'error_message': errorMessage,
+      },
+      where: 'client_request_id = ?',
+      whereArgs: [clientRequestId],
+    );
+  }
+
+  Future<void> deleteAttendanceRequest(String clientRequestId) async {
+    if (_useMemoryFallback) {
+      _webOfflineAttendanceRequests.removeWhere((r) => r['client_request_id'] == clientRequestId);
+      return;
+    }
+    final db = await database;
+    if (db == null) return;
+    await db.delete(
+      'offline_attendance_requests',
+      where: 'client_request_id = ?',
+      whereArgs: [clientRequestId],
+    );
+  }
+
+  Future<int> getPendingAttendanceRequestCount() async {
+    if (_useMemoryFallback) {
+      return _webOfflineAttendanceRequests.where((r) => r['sync_status'] == 'PENDING').length;
+    }
+    final db = await database;
+    if (db == null) return 0;
+    final res = await db.rawQuery(
+      'SELECT COUNT(*) as cnt FROM offline_attendance_requests WHERE sync_status = ?',
+      ['PENDING'],
+    );
+    return Sqflite.firstIntValue(res) ?? 0;
   }
 }

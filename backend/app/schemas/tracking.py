@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from typing import Optional, List, Union, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class StartTrackingRequest(BaseModel):
@@ -154,8 +154,7 @@ class RoutePointDetail(BaseModel):
     employee_id: Optional[str] = None
     device_id: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TrackingSessionSummary(BaseModel):
@@ -189,8 +188,7 @@ class TrackingSessionSummary(BaseModel):
     active_interruption: Optional[str] = None
     interruption_count: Optional[int] = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TrackingInterruptionEventItem(BaseModel):
@@ -213,8 +211,7 @@ class TrackingInterruptionEventItem(BaseModel):
     is_confirmed: bool = True
     recovery_outcome: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ResolveShiftSessionRequest(BaseModel):

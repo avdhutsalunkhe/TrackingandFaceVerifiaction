@@ -76,23 +76,37 @@ object TrackingScheduler {
             set(Calendar.MILLISECOND, 0)
         }
 
+        if (endCal.timeInMillis <= startCal.timeInMillis) {
+            endCal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+
         val nowMs = nowCal.timeInMillis
         val startMs = startCal.timeInMillis
         val endMs = endCal.timeInMillis
 
+        val prevStartCal = (startCal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -1) }
+        val prevEndCal = (endCal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -1) }
+        val isInPrevWindow = nowMs in prevStartCal.timeInMillis until prevEndCal.timeInMillis
+
         if (nowMs in startMs until endMs) {
-            // Within tracking window (08:00 – 18:00)
+            // Within tracking window
             Log.i(TAG, "Current time is within scheduled tracking window ($startTimeStr – $endTimeStr). Starting service.")
             startTracking(context)
             scheduleAlarm(context, endMs, ACTION_STOP_SCHEDULED, REQUEST_CODE_STOP)
             scheduleWatchdog(context)
+        } else if (isInPrevWindow) {
+            // Within yesterday's overnight shift window
+            Log.i(TAG, "Current time is within overnight scheduled window spanning from yesterday ($startTimeStr – $endTimeStr). Starting service.")
+            startTracking(context)
+            scheduleAlarm(context, prevEndCal.timeInMillis, ACTION_STOP_SCHEDULED, REQUEST_CODE_STOP)
+            scheduleWatchdog(context)
         } else if (nowMs < startMs) {
-            // Before 08:00 AM
+            // Before shift window
             Log.i(TAG, "Current time is before window. Scheduling start at $startTimeStr.")
             stopTracking(context)
             scheduleAlarm(context, startMs, ACTION_START_SCHEDULED, REQUEST_CODE_START)
         } else {
-            // After 06:00 PM -> Schedule next day's 08:00 AM
+            // After shift window -> Schedule next day's start
             Log.i(TAG, "Current time is after window. Scheduling start for tomorrow.")
             stopTracking(context)
             startCal.add(Calendar.DAY_OF_YEAR, 1)

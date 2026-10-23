@@ -379,6 +379,7 @@ def start_tracking_session(
 
 
 @router.post("/points", response_model=SyncRoutePointsResponse)
+@router.post("/batch", response_model=SyncRoutePointsResponse)
 def sync_route_points(
     req: SyncRoutePointsRequest,
     current_user: User = Depends(get_current_user),

@@ -10,6 +10,7 @@ import '../../core/theme/app_theme.dart';
 import '../../core/constants/api_constants.dart';
 import '../../core/network/api_client.dart';
 import '../../core/services/server_time_service.dart';
+import '../../core/services/device_service.dart';
 import '../../widgets/camera_overlay.dart';
 import 'send_attendance_request_screen.dart';
 
@@ -88,6 +89,13 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
   void initState() {
     super.initState();
     _initFrontCamera();
+  }
+
+  @override
+  void dispose() {
+    _isAutoLoopActive = false;
+    _cameraController?.dispose();
+    super.dispose();
   }
 
   Future<void> _initFrontCamera() async {
@@ -204,13 +212,14 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
       } catch (_) {}
 
       final requestId = 'REQ_${DateTime.now().millisecondsSinceEpoch}';
+      final actualDeviceId = await DeviceService.instance.getDeviceId();
       final res = await _apiClient.postMultipart(
         endpoint: ApiConstants.verifyAttendance,
         fields: {
           'current_latitude': widget.currentLatitude.toString(),
           'current_longitude': widget.currentLongitude.toString(),
           'gps_accuracy': (widget.gpsAccuracy ?? 10.0).toString(),
-          'device_id': 'MOBILE_APP_CLIENT',
+          'device_id': actualDeviceId,
           'request_id': requestId,
           'client_punch_id': clientPunchId,
           'verification_no': widget.activeVerificationNo.toString(),
@@ -275,7 +284,7 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
         _currentStep = VerificationStep.error;
         _overlayState = OvalState.error;
       });
-      _showGenericErrorDialog();
+      _showDifferentiatedErrorDialog(e);
     } finally {
       if (mounted) setState(() => _isProcessing = false);
     }
@@ -726,8 +735,77 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
     );
   }
 
-  /// Dialog: Generic Error (Section 11)
-  void _showGenericErrorDialog() {
+  void _restartVerification() {
+    setState(() {
+      _isAutoLoopActive = true;
+      _currentStep = VerificationStep.cameraFaceScan;
+    });
+    _startGuidedSequence();
+  }
+
+  /// Dialog: Differentiated Error handling (distinguishes 401/403, timeout, network, server errors)
+  void _showDifferentiatedErrorDialog(dynamic error) {
+    String title = 'Unable to verify attendance';
+    String message = 'Please check your connection and try again.';
+    String buttonText = 'TRY AGAIN';
+    IconData icon = Icons.error_outline_rounded;
+    Color iconColor = const Color(0xFFDC2626);
+    Color iconBgColor = const Color(0xFFFEF2F2);
+
+    if (error is ApiException) {
+      if (error.isUnauthorized) {
+        title = 'Session Expired';
+        message = 'Your session has expired. Please log in again.';
+        buttonText = 'LOG IN AGAIN';
+        icon = Icons.lock_clock_outlined;
+        iconColor = const Color(0xFFD97706);
+        iconBgColor = const Color(0xFFFEF3C7);
+      } else if (error.isForbidden) {
+        title = 'Access Denied';
+        message = error.message.isNotEmpty
+            ? error.message
+            : 'You do not have permission to verify attendance on this account.';
+        buttonText = 'GO TO DASHBOARD';
+        icon = Icons.block_rounded;
+        iconColor = const Color(0xFFDC2626);
+        iconBgColor = const Color(0xFFFEF2F2);
+      } else if (error.isTimeout) {
+        title = 'Verification Timed Out';
+        message = 'The attendance server took too long to respond. Please check your network and try again.';
+        buttonText = 'TRY AGAIN';
+        icon = Icons.timer_off_outlined;
+        iconColor = const Color(0xFFD97706);
+        iconBgColor = const Color(0xFFFEF3C7);
+      } else if (error.isServerError) {
+        title = 'Service Unavailable';
+        message = 'Attendance service is temporarily unavailable (${error.statusCode}). Please try again shortly.';
+        buttonText = 'TRY AGAIN';
+        icon = Icons.cloud_off_rounded;
+        iconColor = const Color(0xFFDC2626);
+        iconBgColor = const Color(0xFFFEF2F2);
+      } else if (error.isNetworkFailure) {
+        title = 'Connection Failed';
+        message = 'Please check your connection and try again.';
+        buttonText = 'TRY AGAIN';
+        icon = Icons.wifi_off_rounded;
+        iconColor = const Color(0xFFDC2626);
+        iconBgColor = const Color(0xFFFEF2F2);
+      } else {
+        title = 'Verification Error';
+        message = error.message.isNotEmpty ? error.message : 'Unable to complete verification. Please try again.';
+        buttonText = 'TRY AGAIN';
+      }
+    } else {
+      final errStr = error.toString().toLowerCase();
+      if (errStr.contains('socket') || errStr.contains('network') || errStr.contains('connection')) {
+        title = 'Connection Failed';
+        message = 'Please check your connection and try again.';
+        icon = Icons.wifi_off_rounded;
+      } else {
+        message = 'An unexpected error occurred. Please try again.';
+      }
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -739,23 +817,27 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
           children: [
             Container(
               padding: const EdgeInsets.all(14),
-              decoration: const BoxDecoration(
-                color: Color(0xFFFEF2F2),
+              decoration: BoxDecoration(
+                color: iconBgColor,
                 shape: BoxShape.circle,
               ),
-              child: const Icon(Icons.error_outline_rounded, color: Color(0xFFDC2626), size: 40),
+              child: Icon(icon, color: iconColor, size: 40),
             ),
             const SizedBox(height: 16),
-            const Text(
-              'Unable to verify attendance',
+            Text(
+              title,
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF991B1B)),
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: iconColor,
+              ),
             ),
             const SizedBox(height: 8),
-            const Text(
-              'Please check your connection and try again.',
+            Text(
+              message,
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
+              style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
             ),
           ],
         ),
@@ -763,17 +845,19 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
           ElevatedButton(
             onPressed: () {
               Navigator.pop(ctx);
-              setState(() {
-                _isAutoLoopActive = true;
-                _currentStep = VerificationStep.cameraFaceScan;
-              });
-              _startGuidedSequence();
+              if (error is ApiException && error.isUnauthorized) {
+                ApiClient.onSessionExpired?.call();
+              } else if (error is ApiException && error.isForbidden) {
+                Navigator.of(context).pop();
+              } else {
+                _restartVerification();
+              }
             },
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.primary,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
             ),
-            child: const Text('TRY AGAIN'),
+            child: Text(buttonText),
           ),
         ],
       ),
@@ -806,13 +890,6 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
         ],
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _isAutoLoopActive = false;
-    _cameraController?.dispose();
-    super.dispose();
   }
 
   @override

@@ -33,7 +33,7 @@ class ShiftEngineService:
                 EmployeeShiftAssignment.effective_from <= target_date,
             )
             .filter(
-                (EmployeeShiftAssignment.effective_to == None)
+                (EmployeeShiftAssignment.effective_to.is_(None))
                 | (EmployeeShiftAssignment.effective_to >= target_date)
             )
             .order_by(EmployeeShiftAssignment.effective_from.desc())

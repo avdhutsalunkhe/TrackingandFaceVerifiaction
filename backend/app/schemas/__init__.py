@@ -24,6 +24,12 @@ from app.schemas.attendance_request import (
     ServerTimeResponse,
 )
 from app.schemas.coordinate import CoordinatePoint
+from app.schemas.app_update import (
+    AppUpdateCheckRequest,
+    AppUpdatePolicyResponse,
+    CreateUpdatePolicyRequest,
+    UpdateTelemetryLogRequest,
+)
 
 __all__ = [
     "TokenResponse",
@@ -55,4 +61,9 @@ __all__ = [
     "AttendanceRequestReview",
     "ServerTimeResponse",
     "CoordinatePoint",
+    "AppUpdateCheckRequest",
+    "AppUpdatePolicyResponse",
+    "CreateUpdatePolicyRequest",
+    "UpdateTelemetryLogRequest",
 ]
+

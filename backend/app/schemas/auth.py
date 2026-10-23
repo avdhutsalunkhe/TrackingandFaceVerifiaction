@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    refresh_token: Optional[str] = None
     expires_in: int = Field(default=28800, description="Token validity duration in seconds (default: 8 hours)")
     expires_at: Optional[int] = Field(None, description="Expiration UTC timestamp in seconds")
     user_id: Optional[int] = None
@@ -23,6 +24,11 @@ class TokenResponse(BaseModel):
     device_id: Optional[str] = None
     is_device_registered: bool = False
     client_type: Optional[str] = "WEB"
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1, description="Signed JWT refresh token")
+    device_id: Optional[str] = Field(None, description="Client Device Hardware Identifier")
+    client_type: Optional[str] = Field(None, description="Client platform: 'WEB' or 'MOBILE'")
 
 class LoginRequest(BaseModel):
     employee_id: str = Field(..., min_length=1, max_length=64, description="Employee ID or Admin ID")

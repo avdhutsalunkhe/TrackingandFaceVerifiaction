@@ -287,18 +287,26 @@ class TrackingForegroundService : Service(), LocationListener {
         val sUuid = sessionUuid ?: return
         try {
             db?.let { database ->
-                // Query max sequence number
+                // Query max sequence number from SQLite and SharedPreferences
+                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                val prefSeq = prefs.getInt("tracking_last_seq_$sUuid", 0)
+                var maxSeq = prefSeq
+
                 val cursor = database.rawQuery(
                     "SELECT MAX(sequence_number) FROM offline_route_points WHERE session_uuid = ?",
                     arrayOf(sUuid)
                 )
-                if (cursor.moveToFirst()) {
-                    val maxSeq = cursor.getInt(0)
-                    if (maxSeq > 0) {
-                        sequenceNumber = maxSeq + 1
+                if (cursor.moveToFirst() && !cursor.isNull(0)) {
+                    val dbMaxSeq = cursor.getInt(0)
+                    if (dbMaxSeq > maxSeq) {
+                        maxSeq = dbMaxSeq
                     }
                 }
                 cursor.close()
+
+                if (maxSeq > 0) {
+                    sequenceNumber = maxSeq + 1
+                }
 
                 // Query last point
                 val ptCursor = database.rawQuery(
@@ -429,6 +437,7 @@ class TrackingForegroundService : Service(), LocationListener {
         // Stage 5: Stationary Drift Suppression (Dead-Reckoning Threshold)
         // Speeds < 0.4 m/s with displacement < 4.0m are filtered out to prevent stationary drift
         val isStationary = loc.hasSpeed() && loc.speed < 0.4f && stepDist < 4.0
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
         if (!isStationary && stepDist >= 8.0) {
             totalDistanceMeters += stepDist
             lastLat = lat
@@ -436,7 +445,6 @@ class TrackingForegroundService : Service(), LocationListener {
             lastFixTimeMs = nowMs
 
             // Update SharedPreferences for Flutter
-            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
             prefs.edit().putFloat("flutter.active_tracking_distance", totalDistanceMeters.toFloat()).apply()
         } else if (lastLat == null) {
             lastLat = lat
@@ -445,6 +453,7 @@ class TrackingForegroundService : Service(), LocationListener {
         }
 
         val seq = sequenceNumber++
+        prefs.edit().putInt("tracking_last_seq_$sUuid", seq).apply()
         val clientPointId = "${sUuid}_pt_${seq}_${nowMs}"
         val isoTimestamp = formatIsoUtc(Date(loc.time))
 
@@ -576,23 +585,30 @@ class TrackingForegroundService : Service(), LocationListener {
 
             TrackingScheduler.evaluateAndSchedule(applicationContext)
 
-            // Set restart alarm in case system aggressive task killers kill the process
-            val restartIntent = Intent(applicationContext, TrackingForegroundService::class.java).apply {
-                action = ACTION_START
-                putExtra(EXTRA_SESSION_UUID, activeUuid)
+            // Set restart alarm via TrackingBootReceiver to comply with Android 12+ foreground service launch rules
+            val restartIntent = Intent(applicationContext, TrackingBootReceiver::class.java).apply {
+                action = TrackingScheduler.ACTION_WATCHDOG
             }
-            val pIntent = PendingIntent.getService(
+            val pIntent = PendingIntent.getBroadcast(
                 applicationContext,
-                1001,
+                1004,
                 restartIntent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
             val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            alarmManager.set(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + 1000,
-                pIntent
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 1500,
+                    pIntent
+                )
+            } else {
+                alarmManager.set(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 1500,
+                    pIntent
+                )
+            }
         }
     }
 

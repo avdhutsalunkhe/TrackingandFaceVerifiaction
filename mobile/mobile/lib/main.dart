@@ -8,6 +8,8 @@ import 'core/services/tracking_service.dart';
 import 'core/localization/language_service.dart';
 import 'core/localization/app_translations.dart';
 import 'package:flutter/foundation.dart';
+import 'core/services/patch_manager.dart';
+import 'core/services/app_update_service.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/auth/change_password_screen.dart';
 import 'screens/user/user_dashboard_screen.dart';
@@ -28,11 +30,18 @@ void main() async {
   // Initialize network client with stored preferences
   await ApiClient().init();
 
+  // Initialize silent resource patch manager
+  await PatchManager.instance.init();
+
+  // Start periodic developer-controlled background update check
+  AppUpdateService.instance.startPeriodicBackgroundCheck();
+
   // Initialize language preference
   await LanguageService.instance.init();
 
   // Initialize native local notifications & timezone support
   await NotificationService.instance.init();
+
 
   // Restore background tracking session if previously active
   await TrackingService.instance.checkAndRestoreSession();

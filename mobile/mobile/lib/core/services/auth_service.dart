@@ -21,6 +21,20 @@ class AuthService {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('access_token', res['access_token']);
+    if (res['refresh_token'] != null && res['refresh_token'].toString().isNotEmpty) {
+      await prefs.setString('refresh_token', res['refresh_token'].toString());
+    }
+    if (res['expires_at'] != null) {
+      final exp = res['expires_at'] is int
+          ? res['expires_at']
+          : int.tryParse(res['expires_at'].toString());
+      if (exp != null) {
+        await prefs.setInt('token_expires_at', exp);
+      }
+    }
+    if (deviceId.isNotEmpty) {
+      await prefs.setString('device_id', deviceId);
+    }
     await prefs.setString('role', res['role']);
     await prefs.setString('employee_id', res['employee_id']);
     await prefs.setString('full_name', res['full_name']);
@@ -53,10 +67,13 @@ class AuthService {
   Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('access_token');
+    await prefs.remove('refresh_token');
+    await prefs.remove('token_expires_at');
     await prefs.remove('role');
     await prefs.remove('employee_id');
     await prefs.remove('full_name');
     await prefs.remove('must_change_password');
+    await prefs.remove('user_id');
   }
 
   Future<bool> isLoggedIn() async {

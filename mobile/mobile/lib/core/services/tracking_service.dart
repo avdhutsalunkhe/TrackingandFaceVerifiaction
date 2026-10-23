@@ -11,6 +11,7 @@ import 'notification_service.dart';
 import 'gps_distance_calculator.dart';
 import 'route_simplifier.dart';
 import 'native_background_tracking.dart';
+import 'offline_attendance_service.dart';
 
 enum TrackingStatus {
   idle,
@@ -1344,6 +1345,16 @@ class TrackingService with ChangeNotifier {
       }
     } catch (e) {
       debugPrint('[TrackingService] Interruption sync deferred (offline): $e');
+    }
+
+    // 5. Sync pending offline selfie attendance requests
+    try {
+      final syncedRequests = await OfflineAttendanceService.instance.syncPendingRequests();
+      if (syncedRequests > 0) {
+        debugPrint('[TrackingService] Synced $syncedRequests offline selfie attendance requests');
+      }
+    } catch (e) {
+      debugPrint('[TrackingService] Offline selfie sync deferred: $e');
     }
   }
 

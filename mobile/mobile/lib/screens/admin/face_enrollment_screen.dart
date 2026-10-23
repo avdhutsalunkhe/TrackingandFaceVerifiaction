@@ -43,6 +43,13 @@ class _FaceEnrollmentScreenState extends State<FaceEnrollmentScreen> {
     _initFrontCamera();
   }
 
+  @override
+  void dispose() {
+    _isAutoLoopRunning = false;
+    _cameraController?.dispose();
+    super.dispose();
+  }
+
   Future<void> _initFrontCamera() async {
     try {
       _cameras = await availableCameras();
@@ -273,13 +280,6 @@ class _FaceEnrollmentScreenState extends State<FaceEnrollmentScreen> {
         ],
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _isAutoLoopRunning = false;
-    _cameraController?.dispose();
-    super.dispose();
   }
 
   @override

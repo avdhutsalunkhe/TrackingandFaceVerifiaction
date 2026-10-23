@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 class RoleMasterBase(BaseModel):
     role_code: str
@@ -27,8 +27,7 @@ class RoleMasterResponse(RoleMasterBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class AssignUserRoleRequest(BaseModel):
     user_id: int

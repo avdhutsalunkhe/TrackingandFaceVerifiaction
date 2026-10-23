@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.models.user import User, UserRole
 from app.config import settings
 from app.security.hashing import verify_password, get_password_hash
-from app.security.tokens import create_access_token
+from app.security.tokens import create_access_token, create_refresh_token
 from app.services.audit_service import log_audit_event
 
 def authenticate_user(db: Session, employee_id: str, password: str) -> Optional[User]:
@@ -29,8 +29,19 @@ def create_user_token(user: User, client_type: Optional[str] = "WEB") -> dict:
     expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(data=payload, expires_delta=expires_delta)
     expire_timestamp = int((datetime.now(timezone.utc) + expires_delta).timestamp())
+
+    refresh_payload = {
+        "sub": str(user.id),
+        "user_id": user.id,
+        "employee_id": user.employee_id,
+        "role": user.role.value,
+        "client_type": eff_client_type
+    }
+    refresh_token = create_refresh_token(data=refresh_payload)
+
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "expires_at": expire_timestamp,

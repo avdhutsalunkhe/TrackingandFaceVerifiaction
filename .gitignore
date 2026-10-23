@@ -28,6 +28,7 @@ release_apks/*
 backend/release_apks/*
 !backend/release_apks/version.json
 *.apk
+!backend/release_apks/fieldstaff-attendance-universal-release.apk
 *.aab
 *.exe
 *.dll

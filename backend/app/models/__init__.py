@@ -1,4 +1,4 @@
-﻿from app.models.user import User, UserRole
+from app.models.user import User, UserRole
 from app.models.role import RoleMaster
 from app.models.face import FaceTemplate, FaceEnrollmentSample
 from app.models.geofence import Geofence, AttendanceWindow
@@ -25,6 +25,7 @@ from app.models.attendance_request import AttendanceRequest, RequestStatus
 from app.models.audit import AuditLog
 from app.models.setting import SystemSetting
 from app.models.tracking import TrackingSession, GpsRoutePoint
+from app.models.app_update import AppUpdatePolicy, AppUpdateLog
 
 __all__ = [
     "User",
@@ -57,4 +58,7 @@ __all__ = [
     "SystemSetting",
     "TrackingSession",
     "GpsRoutePoint",
+    "AppUpdatePolicy",
+    "AppUpdateLog",
 ]
+

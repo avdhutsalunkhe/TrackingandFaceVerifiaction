@@ -2,11 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User, UserRole
-from app.schemas.auth import LoginRequest, TokenResponse, ChangePasswordRequest
+from app.schemas.auth import LoginRequest, TokenResponse, ChangePasswordRequest, RefreshTokenRequest
 from app.schemas.user import UserResponse, GeofenceSummary, AttendanceWindowSummary
 from app.services.auth_service import authenticate_user, create_user_token
 from app.services.audit_service import log_audit_event
 from app.security.hashing import verify_password, get_password_hash
+from app.security.tokens import decode_refresh_token
 from app.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -122,6 +123,68 @@ def login(login_data: LoginRequest, request: Request, db: Session = Depends(get_
         action="USER_LOGIN_SUCCESS",
         actor_user_id=user.id,
         target_user_id=user.id,
+        ip_address=request.client.host if request.client else None
+    )
+
+    token_info = create_user_token(user, client_type=client_type)
+    return TokenResponse(**token_info)
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh_token(
+    refresh_data: RefreshTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Secure token refresh endpoint.
+    Accepts valid signed refresh token and returns a fresh access token (and refresh token).
+    Enforces active user check and device binding rules.
+    """
+    token_str = refresh_data.refresh_token
+    payload = decode_refresh_token(token_str)
+    user_id = payload.get("sub") or payload.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employee account is deactivated. Please contact your administrator.",
+        )
+
+    # Determine client platform
+    client_type = refresh_data.client_type or payload.get("client_type") or request.headers.get("x-client-type") or "MOBILE"
+
+    # Enforce device binding check if employee is on mobile
+    if user.role == UserRole.USER:
+        incoming_device_id = (refresh_data.device_id or request.headers.get("x-device-id") or "").strip()
+        user_assigned_device = (user.device_id or "").strip()
+        binding_enabled = getattr(user, "device_binding_enabled", True)
+        if binding_enabled and user_assigned_device and incoming_device_id:
+            if incoming_device_id != user_assigned_device:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This device is not registered for your account.",
+                )
+
+    log_audit_event(
+        db=db,
+        action="TOKEN_REFRESH_SUCCESS",
+        actor_user_id=user.id,
+        target_user_id=user.id,
+        details={"client_type": client_type},
         ip_address=request.client.host if request.client else None
     )
 
