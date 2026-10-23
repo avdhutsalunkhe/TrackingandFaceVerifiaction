@@ -262,25 +262,39 @@ async def verify_attendance(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No camera frames provided")
 
     from starlette.concurrency import run_in_threadpool
-    decision = await run_in_threadpool(
-        AttendanceDecisionService.evaluate_attendance,
-        db=db,
-        user=current_user,
-        current_lat=current_latitude,
-        current_lon=current_longitude,
-        gps_accuracy=gps_accuracy,
-        frames_bytes_list=frames_bytes,
-        device_id=device_id,
-        request_id=request_id,
-        ip_address=request.client.host if request.client else None,
-        client_punch_id=client_punch_id,
-        punch_period_id=punch_period_id,
-        verification_no=verification_no,
-        verification_rule_id=verification_rule_id,
-        device_wall_time=device_wall_time
-    )
-
-    return decision
+    try:
+        decision = await run_in_threadpool(
+            AttendanceDecisionService.evaluate_attendance,
+            db=db,
+            user=current_user,
+            current_lat=current_latitude,
+            current_lon=current_longitude,
+            gps_accuracy=gps_accuracy,
+            frames_bytes_list=frames_bytes,
+            device_id=device_id,
+            request_id=request_id,
+            ip_address=request.client.host if request.client else None,
+            client_punch_id=client_punch_id,
+            punch_period_id=punch_period_id,
+            verification_no=verification_no,
+            verification_rule_id=verification_rule_id,
+            device_wall_time=device_wall_time
+        )
+        return decision
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        import logging, traceback
+        logging.getLogger(__name__).error(f"[verify_attendance] Internal error during verification: {e}\n{traceback.format_exc()}")
+        return AttendanceVerifyResponse(
+            success=False,
+            decision="REJECTED",
+            rejection_reason="BIOMETRIC_SERVICE_ERROR",
+            message=f"Attendance verification temporarily unavailable: {str(e)}",
+            timestamp=datetime.utcnow(),
+            client_punch_id=client_punch_id
+        )
 
 @router.post("/attendance-request", response_model=AttendanceRequestResponse)
 async def submit_attendance_request(

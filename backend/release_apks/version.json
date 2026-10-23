@@ -9,7 +9,7 @@
   "apkUrl": "/api/app/download-apk",
   "apk_filename": "fieldstaff-attendance-universal-release.apk",
   "file_size_bytes": 64507799,
-  "sha256": "12CCF004384EE71200B00B6B4F714B482BF66731F6504976D45855574F9B04D3",
+  "sha256": "A1BCCCBDBA1F9A165EEA2D973913D89A325E9D2797372AF7AB63550EF950EC57",
   "releaseNotes": [
     "Keep live background upload active when app is closed with auto-token refresh on 401",
     "Online-first real-time GPS upload: transmits coordinates directly to backend without routine local storage",

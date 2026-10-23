@@ -78,40 +78,50 @@ class AttendanceDecisionService:
             v_no: Optional[int] = None,
             v_rule_id: Optional[int] = None,
         ) -> AttendanceVerifyResponse:
-            attempt = AttendanceAttempt(
-                user_id=user.id,
-                punch_period_id=v_rule_id or punch_period_id or verification_rule_id,
-                verification_no=v_no or verification_no,
-                verification_rule_id=v_rule_id or verification_rule_id or punch_period_id,
-                timestamp=now_utc,
-                attempt_status=AttemptStatus.REJECTED,
-                rejection_reason=reason,
-                source="ONLINE",
-                latitude=current_lat,
-                longitude=current_lon,
-                calculated_distance_meters=distance,
-                gps_accuracy=gps_accuracy,
-                face_similarity_score=sim_score,
-                liveness_result=live_res,
-                liveness_score=live_score,
-                device_id=device_id,
-                request_id=request_id,
-                client_punch_id=client_punch_id,
-                details=details or {"error_message": msg}
-            )
-            db.add(attempt)
-            db.commit()
-            
-            log_audit_event(
-                db=db,
-                action="ATTENDANCE_ATTEMPT_REJECTED",
-                actor_user_id=user.id,
-                target_user_id=user.id,
-                details={"reason": reason.value, "message": msg, "distance": distance, "verification_no": v_no, "rule_id": v_rule_id},
-                ip_address=ip_address
-            )
+            try:
+                attempt = AttendanceAttempt(
+                    user_id=user.id,
+                    punch_period_id=v_rule_id if (v_rule_id and isinstance(v_rule_id, int) and v_rule_id > 0) else None,
+                    verification_no=v_no or verification_no,
+                    verification_rule_id=None,
+                    timestamp=now_utc,
+                    attempt_status=AttemptStatus.REJECTED,
+                    rejection_reason=reason if isinstance(reason, RejectionReason) else RejectionReason.BIOMETRIC_SERVICE_ERROR,
+                    source="ONLINE",
+                    latitude=current_lat,
+                    longitude=current_lon,
+                    calculated_distance_meters=distance,
+                    gps_accuracy=gps_accuracy,
+                    face_similarity_score=sim_score,
+                    liveness_result=live_res,
+                    liveness_score=live_score,
+                    device_id=device_id,
+                    request_id=request_id,
+                    client_punch_id=client_punch_id,
+                    details=details or {"error_message": msg}
+                )
+                db.add(attempt)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"[AttendanceDecisionService] Warning: Failed to record attempt: {e}")
+
+            try:
+                reason_val = reason.value if hasattr(reason, "value") else str(reason)
+                log_audit_event(
+                    db=db,
+                    action="ATTENDANCE_ATTEMPT_REJECTED",
+                    actor_user_id=user.id,
+                    target_user_id=user.id,
+                    details={"reason": reason_val, "message": msg, "distance": distance, "verification_no": v_no, "rule_id": v_rule_id},
+                    ip_address=ip_address
+                )
+            except Exception as e:
+                db.rollback()
+                print(f"[AttendanceDecisionService] Warning: Failed to log audit event: {e}")
 
             geofence = user.geofence
+            allowed_rad = float(geofence.radius_meters) if (geofence and geofence.radius_meters is not None) else None
             return AttendanceVerifyResponse(
                 success=False,
                 decision="REJECTED",
@@ -119,7 +129,7 @@ class AttendanceDecisionService:
                 message=msg,
                 verification_no=v_no or verification_no,
                 calculated_distance_meters=distance,
-                allowed_radius_meters=float(geofence.radius_meters) if geofence else None,
+                allowed_radius_meters=allowed_rad,
                 face_similarity_score=sim_score,
                 liveness_result=live_res,
                 liveness_score=live_score,
@@ -131,6 +141,10 @@ class AttendanceDecisionService:
         if client_punch_id:
             existing_by_id = db.query(Attendance).filter(Attendance.client_punch_id == client_punch_id).first()
             if existing_by_id:
+                calc_dist = float(existing_by_id.verified_distance_meters) if existing_by_id.verified_distance_meters is not None else None
+                allowed_rad = float(user.geofence.radius_meters) if (user.geofence and user.geofence.radius_meters is not None) else None
+                sim_sc = float(existing_by_id.face_similarity_score) if existing_by_id.face_similarity_score is not None else None
+                live_sc = float(existing_by_id.liveness_score) if existing_by_id.liveness_score is not None else None
                 return AttendanceVerifyResponse(
                     success=True,
                     decision="PRESENT",
@@ -139,11 +153,11 @@ class AttendanceDecisionService:
                     verification_window=existing_by_id.verification_window,
                     verification_status=existing_by_id.verification_status,
                     attendance_classification=existing_by_id.attendance_classification,
-                    calculated_distance_meters=float(existing_by_id.verified_distance_meters),
-                    allowed_radius_meters=float(user.geofence.radius_meters) if user.geofence else None,
-                    face_similarity_score=float(existing_by_id.face_similarity_score),
+                    calculated_distance_meters=calc_dist,
+                    allowed_radius_meters=allowed_rad,
+                    face_similarity_score=sim_sc,
                     liveness_result="REAL",
-                    liveness_score=float(existing_by_id.liveness_score),
+                    liveness_score=live_sc,
                     timestamp=existing_by_id.timestamp,
                     client_punch_id=existing_by_id.client_punch_id
                 )
@@ -308,16 +322,27 @@ class AttendanceDecisionService:
                 )
 
             # 8. PRIMARY BIOMETRIC GATE: Run Deep-Learning Biometric Verification (Face Detection + Liveness + ArcFace)
-            t_bio_start = monotonic_timer.perf_counter_ns()
-            is_match, ml_err_code, ml_msg, sim_score, live_score, ml_details = face_pipeline.verify_live_sequence(
-                frames_bytes_list=frames_bytes_list,
-                reference_embedding=ref_embedding
-            )
-            biometric_eval_ms = round((monotonic_timer.perf_counter_ns() - t_bio_start) / 1_000_000.0, 2)
-            if ml_details is None:
-                ml_details = {}
-            ml_details["template_fetch_ms"] = template_fetch_ms
-            ml_details["biometric_total_ms"] = biometric_eval_ms
+            try:
+                t_bio_start = monotonic_timer.perf_counter_ns()
+                is_match, ml_err_code, ml_msg, sim_score, live_score, ml_details = face_pipeline.verify_live_sequence(
+                    frames_bytes_list=frames_bytes_list,
+                    reference_embedding=ref_embedding
+                )
+                biometric_eval_ms = round((monotonic_timer.perf_counter_ns() - t_bio_start) / 1_000_000.0, 2)
+                if ml_details is None:
+                    ml_details = {}
+                ml_details["template_fetch_ms"] = template_fetch_ms
+                ml_details["biometric_total_ms"] = biometric_eval_ms
+            except Exception as e:
+                import logging, traceback
+                logging.getLogger(__name__).error(f"[evaluate_attendance] Biometric pipeline error: {e}\n{traceback.format_exc()}")
+                return record_failure(
+                    reason=RejectionReason.BIOMETRIC_SERVICE_ERROR,
+                    msg=f"Biometric processing error: {str(e)}",
+                    distance=distance_meters,
+                    v_no=active_v_no,
+                    v_rule_id=active_r_id
+                )
 
             if not is_match:
                 rejection_reason_enum = RejectionReason.FACE_MISMATCH
@@ -360,10 +385,10 @@ class AttendanceDecisionService:
         new_attendance = Attendance(
             user_id=user.id,
             attendance_date=today_date,
-            punch_period_id=active_r_id,
+            punch_period_id=active_r_id if (active_r_id and isinstance(active_r_id, int) and active_r_id > 0) else None,
             verification_no=active_v_no,
-            verification_rule_id=active_r_id,
-            verification_window=target_period["label"],
+            verification_rule_id=None,
+            verification_window=target_period.get("label", "08:00:00 - 18:00:00"),
             timestamp=now_utc,
             server_time=now_utc,
             device_wall_time=device_wall_time,
@@ -376,11 +401,11 @@ class AttendanceDecisionService:
             attendance_classification=classification,
             verified_latitude=current_lat,
             verified_longitude=current_lon,
-            verified_distance_meters=distance_meters,
+            verified_distance_meters=distance_meters if distance_meters is not None else 0.0,
             gps_accuracy=gps_accuracy,
-            face_similarity_score=sim_score,
+            face_similarity_score=sim_score if sim_score is not None else 1.0,
             face_result="MATCH",
-            liveness_score=live_score,
+            liveness_score=live_score if live_score is not None else 1.0,
             liveness_result="REAL",
             device_id=device_id
         )
@@ -390,16 +415,16 @@ class AttendanceDecisionService:
         attempt_details = dict(ml_details or {})
         attempt_details["punch_period_id"] = active_r_id
         attempt_details["verification_no"] = active_v_no
-        attempt_details["verification_rule_id"] = active_r_id
-        attempt_details["window"] = target_period["label"]
+        attempt_details["verification_rule_id"] = None
+        attempt_details["window"] = target_period.get("label", "")
         attempt_details["classification"] = classification
         attempt_details["shift_code"] = effective_shift.shift_code if effective_shift else "DYNAMIC_SHIFT"
 
         attempt = AttendanceAttempt(
             user_id=user.id,
-            punch_period_id=active_r_id,
+            punch_period_id=active_r_id if (active_r_id and isinstance(active_r_id, int) and active_r_id > 0) else None,
             verification_no=active_v_no,
-            verification_rule_id=active_r_id,
+            verification_rule_id=None,
             timestamp=now_utc,
             attempt_status=AttemptStatus.SUCCESS,
             source="ONLINE",
@@ -417,43 +442,49 @@ class AttendanceDecisionService:
         )
         db.add(attempt)
 
-        log_audit_event(
-            db=db,
-            action="ATTENDANCE_MARKED_PRESENT",
-            actor_user_id=user.id,
-            target_user_id=user.id,
-            details={
-                "punch_period_id": active_r_id,
-                "verification_no": active_v_no,
-                "verification_rule_id": active_r_id,
-                "window": target_period["label"],
-                "distance_meters": distance_meters,
-                "similarity_score": sim_score,
-                "liveness_score": live_score,
-                "client_punch_id": client_punch_id
-            },
-            ip_address=ip_address,
-            commit=False
-        )
+        try:
+            log_audit_event(
+                db=db,
+                action="ATTENDANCE_MARKED_PRESENT",
+                actor_user_id=user.id,
+                target_user_id=user.id,
+                details={
+                    "punch_period_id": active_r_id,
+                    "verification_no": active_v_no,
+                    "verification_rule_id": active_r_id,
+                    "window": target_period.get("label", ""),
+                    "distance_meters": distance_meters,
+                    "similarity_score": sim_score,
+                    "liveness_score": live_score,
+                    "client_punch_id": client_punch_id
+                },
+                ip_address=ip_address,
+                commit=False
+            )
+        except Exception as e:
+            print(f"[AttendanceDecisionService] Audit log warning: {e}")
 
         db.commit()
         db.refresh(new_attendance)
+
+        loc_label = geofence.location_name if (geofence and geofence.location_name) else "Assigned Location"
+        allowed_rad = float(geofence.radius_meters) if (geofence and geofence.radius_meters is not None) else None
 
         return AttendanceVerifyResponse(
             success=True,
             decision="PRESENT",
             rejection_reason=None,
-            message=f"Attendance Punch '{target_period['period_name']}' recorded successfully at {geofence.location_name} ({target_period['label']})",
+            message=f"Attendance Punch '{target_period.get('period_name', 'Punch')}' recorded successfully at {loc_label} ({target_period.get('label', '')})",
             punch_period_id=active_r_id,
             punch_no=active_v_no,
             verification_no=active_v_no,
-            verification_window=target_period["label"],
+            verification_window=target_period.get("label", ""),
             verification_status="CONFIRMED",
             shift_id=effective_shift.id if effective_shift else None,
             shift_name=effective_shift.shift_name if effective_shift else "Dynamic Shift",
             attendance_classification=classification,
             calculated_distance_meters=distance_meters,
-            allowed_radius_meters=float(geofence.radius_meters),
+            allowed_radius_meters=allowed_rad,
             face_similarity_score=sim_score,
             liveness_result="REAL",
             liveness_score=live_score,

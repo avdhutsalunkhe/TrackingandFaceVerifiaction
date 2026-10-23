@@ -842,22 +842,53 @@ class _VerifyAttendanceScreenState extends State<VerifyAttendanceScreen> {
           ],
         ),
         actions: [
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              if (error is ApiException && error.isUnauthorized) {
-                ApiClient.onSessionExpired?.call();
-              } else if (error is ApiException && error.isForbidden) {
-                Navigator.of(context).pop();
-              } else {
-                _restartVerification();
-              }
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.primary,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            ),
-            child: Text(buttonText),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  if (error is ApiException && error.isUnauthorized) {
+                    ApiClient.onSessionExpired?.call();
+                  } else if (error is ApiException && error.isForbidden) {
+                    Navigator.of(context).pop();
+                  } else {
+                    _restartVerification();
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.primary,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                child: Text(buttonText),
+              ),
+              if (error is ApiException && (error.isServerError || error.isNetworkFailure || error.isTimeout)) ...[
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    Navigator.pushReplacement(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => SendAttendanceRequestScreen(
+                          initialLatitude: widget.currentLatitude,
+                          initialLongitude: widget.currentLongitude,
+                          initialAccuracy: widget.gpsAccuracy,
+                          initialLocationName: widget.locationName,
+                          verificationNo: widget.activeVerificationNo,
+                          reason: 'Attendance service temporarily unavailable (${error.statusCode})',
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text(
+                    'Trouble verifying? Submit Attendance Request',
+                    style: TextStyle(fontSize: 12, color: AppColors.textSecondary, decoration: TextDecoration.underline),
+                  ),
+                ),
+              ],
+            ],
           ),
         ],
       ),

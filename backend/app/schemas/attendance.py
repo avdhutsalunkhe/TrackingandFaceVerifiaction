@@ -70,7 +70,7 @@ class TodayScheduleResponse(BaseModel):
 class AttendanceVerifyResponse(BaseModel):
     success: bool
     decision: str # "PRESENT" or "REJECTED"
-    rejection_reason: Optional[RejectionReason] = None
+    rejection_reason: Optional[Any] = None
     message: str
     
     # Punch Period / Verification Window Telemetry
