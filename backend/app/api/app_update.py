@@ -68,7 +68,10 @@ def _get_version_metadata() -> dict:
     return {}
 
 def _get_or_create_default_policy(db: Session, channel: str = "direct_apk") -> AppUpdatePolicy:
-    """Retrieves active policy from DB or seeds an initial one from local artifacts."""
+    """Retrieves active policy from DB or seeds/updates one from local version metadata."""
+    meta = _get_version_metadata()
+    meta_version_code = meta.get("versionCode", 4)
+
     policy = (
         db.query(AppUpdatePolicy)
         .filter(
@@ -79,15 +82,29 @@ def _get_or_create_default_policy(db: Session, channel: str = "direct_apk") -> A
         .order_by(desc(AppUpdatePolicy.latest_version_code))
         .first()
     )
+
+    apk_path = _find_release_apk()
+    file_size = meta.get("file_size_bytes") or (os.path.getsize(apk_path) if apk_path and os.path.isfile(apk_path) else 0)
+    sha256_hash = meta.get("sha256") or (_calculate_file_sha256(apk_path) if apk_path and os.path.isfile(apk_path) else None)
+
     if policy:
+        if policy.latest_version_code < meta_version_code:
+            policy.latest_version = meta.get("version", policy.latest_version)
+            policy.latest_version_code = meta_version_code
+            policy.min_supported_version_code = meta.get("minimumSupportedVersionCode", policy.min_supported_version_code)
+            policy.is_mandatory = meta.get("forceUpdate", policy.is_mandatory)
+            if file_size > 0:
+                policy.file_size_bytes = file_size
+            if sha256_hash:
+                policy.sha256_hash = sha256_hash
+            if "releaseNotes" in meta:
+                policy.release_notes = json.dumps(meta["releaseNotes"])
+            policy.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(policy)
         return policy
 
     # Fallback to local artifacts
-    meta = _get_version_metadata()
-    apk_path = _find_release_apk()
-    file_size = os.path.getsize(apk_path) if apk_path else 0
-    sha256_hash = _calculate_file_sha256(apk_path) if apk_path else None
-
     version_str = meta.get("version", "1.0.3")
     version_code = meta.get("versionCode", 4)
     force_update = meta.get("forceUpdate", False)
@@ -140,19 +157,7 @@ def get_app_update_policy(
     Supports dynamic developer-controlled policies, dual distribution (Play Store vs Direct APK),
     and resource patch vs full APK updates.
     """
-    policy = (
-        db.query(AppUpdatePolicy)
-        .filter(
-            AppUpdatePolicy.platform == platform,
-            AppUpdatePolicy.distribution_channel.in_([channel, "all"]),
-            AppUpdatePolicy.is_active == True,
-        )
-        .order_by(desc(AppUpdatePolicy.latest_version_code))
-        .first()
-    )
-
-    if not policy:
-        policy = _get_or_create_default_policy(db, channel)
+    policy = _get_or_create_default_policy(db, channel)
 
     has_update = policy.latest_version_code > version_code
     is_mandatory = policy.is_mandatory or (version_code < policy.min_supported_version_code)
