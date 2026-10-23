@@ -180,6 +180,8 @@ class TrackingSessionSummary(BaseModel):
     shift_name: Optional[str] = None
     shift_start_time: Optional[datetime] = None
     shift_end_time: Optional[datetime] = None
+    actual_start_time: Optional[datetime] = None
+    actual_stop_time: Optional[datetime] = None
     last_accepted_time: Optional[datetime] = None
     last_heartbeat_time: Optional[datetime] = None
     last_sync_time: Optional[datetime] = None
@@ -361,4 +363,34 @@ class TrackingEventRequest(BaseModel):
 class TrackingEventResponse(BaseModel):
     success: bool
     message: str
+
+
+class LivePingRequest(BaseModel):
+    session_uuid: Optional[str] = None
+    latitude: float
+    longitude: float
+    accuracy_meters: Optional[float] = 10.0
+    accuracy: Optional[float] = None
+    speed_mps: Optional[float] = None
+    speed: Optional[float] = None
+    bearing_degrees: Optional[float] = None
+    heading: Optional[float] = None
+    altitude_meters: Optional[float] = None
+    altitude: Optional[float] = None
+    recorded_at: Optional[datetime] = None
+    timestamp: Optional[datetime] = None
+    battery_level: Optional[int] = None
+    is_charging: Optional[bool] = None
+    network_type: Optional[str] = None
+
+
+class LivePingResponse(BaseModel):
+    success: bool
+    message: str
+    session_id: Optional[int] = None
+    session_status: Optional[str] = None
+    address: Optional[Dict[str, Any]] = None
+    server_time: datetime
+
+
 

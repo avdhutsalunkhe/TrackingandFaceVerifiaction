@@ -1,15 +1,19 @@
 from datetime import datetime, date, timedelta, time
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+import pytz
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func, or_
+from sqlalchemy import desc, asc, func, or_
+from sqlalchemy.exc import IntegrityError
 
 from app.database import get_db
 from app.models.user import User, UserRole
 from app.models.tracking import TrackingSession, GpsRoutePoint, TrackingRouteChunk, TrackingInterruptionEvent
 from app.models.shift import Shift, ShiftPunchPeriod
 from app.services.shift_service import ShiftService
+from app.services.shift_engine_service import ShiftEngineService
+from app.services.shift_tracking_scheduler_service import ShiftTrackingSchedulerService
 from app.schemas.tracking import (
     StartTrackingRequest,
     StartTrackingResponse,
@@ -43,53 +47,168 @@ from app.schemas.tracking import (
     SyncOfflineEventsRequest,
     SyncOfflineEventsResponse,
     TrackingInterruptionEventItem,
+    LivePingRequest,
+    LivePingResponse,
 )
 from app.dependencies import get_current_user, require_admin
-from app.services.geofence_service import is_valid_coordinate
+from app.services.geofence_service import is_valid_coordinate, calculate_haversine_distance
 from app.services.route_simplification_service import RouteSimplificationService, RouteSimplificationOptions
 
 router = APIRouter(prefix="/api/tracking", tags=["GPS Journey Tracking"])
 
 
+def _to_time(val: Any) -> Optional[time]:
+    """Safely normalizes time representations (time, timedelta, str) to standard datetime.time."""
+    if val is None:
+        return None
+    if isinstance(val, time):
+        return val
+    if isinstance(val, timedelta):
+        total_seconds = int(val.total_seconds())
+        hours = (total_seconds // 3600) % 24
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return time(hours, minutes, seconds)
+    if isinstance(val, str):
+        try:
+            parts = [int(p) for p in val.strip().split(":")]
+            return time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0)
+        except Exception:
+            return None
+    return None
+
+
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Safely normalizes datetime to offset-naive UTC datetime to prevent TypeError in comparisons."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        return dt.astimezone(pytz.utc).replace(tzinfo=None)
+    return dt
+
+
 def _resolve_shift_window(db: Session, user_id: int, target_date: date, shift_id: Optional[int] = None):
-    """Calculates effective shift, start time, end time, and timezone."""
-    shift = None
-    if shift_id:
-        shift = db.query(Shift).filter(Shift.id == shift_id).first()
-    if not shift:
-        shift = ShiftService.get_effective_shift_for_user(db=db, user_id=user_id, target_date=target_date)
+    """Calculates effective shift, start time, end time in UTC timezone with robust fallback."""
+    return ShiftTrackingSchedulerService.resolve_shift_window(
+        db=db, user_id=user_id, target_date=target_date, shift_id=shift_id
+    )
 
-    if not shift:
-        return None, None, None
 
-    periods = shift.punch_periods or []
-    if not periods and shift.rules:
-        periods = shift.rules
+def _ensure_interruption_event(
+    db: Session,
+    session: TrackingSession,
+    reason_code: str,
+    description: str,
+    detected_at: datetime,
+    recovered_at: Optional[datetime],
+    severity: str,
+    recovery_outcome: str,
+):
+    """Ensures an interruption record exists in tracking_interruption_events without duplicate rows."""
+    existing = db.query(TrackingInterruptionEvent).filter(
+        TrackingInterruptionEvent.session_id == session.id,
+        TrackingInterruptionEvent.reason_code == reason_code,
+        TrackingInterruptionEvent.detected_at == detected_at,
+    ).first()
 
-    if not periods:
-        return shift, None, None
+    if not existing:
+        ev_uuid = f"EV_{reason_code}_{session.id}_{int(detected_at.timestamp())}"
+        dur = int((recovered_at - detected_at).total_seconds()) if recovered_at else None
+        ev = TrackingInterruptionEvent(
+            event_uuid=ev_uuid,
+            session_id=session.id,
+            session_uuid=session.session_uuid,
+            user_id=session.user_id,
+            device_id=session.device_id,
+            reason_code=reason_code,
+            description=description,
+            severity=severity,
+            detected_at=detected_at,
+            recovered_at=recovered_at,
+            duration_seconds=dur,
+            last_known_latitude=session.last_accepted_latitude,
+            last_known_longitude=session.last_accepted_longitude,
+            last_known_location_time=session.last_accepted_time or detected_at,
+            is_confirmed=0,
+            recovery_outcome=recovery_outcome,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(ev)
 
-    min_start: Optional[time] = None
-    max_end: Optional[time] = None
 
-    for p in periods:
-        st = getattr(p, "start_time", None)
-        et = getattr(p, "end_time", None)
-        if st is not None:
-            if min_start is None or st < min_start:
-                min_start = st
-        if et is not None:
-            if max_end is None or et > max_end:
-                max_end = et
+def _reconcile_session_health(db: Session, session: TrackingSession):
+    """Reconciles session metrics, status, completeness, and interruption events using ShiftTrackingSchedulerService."""
+    if not session:
+        return
+    ShiftTrackingSchedulerService.reconcile_session(db=db, session=session)
 
-    shift_start_dt = datetime.combine(target_date, min_start) if min_start else None
-    shift_end_dt = datetime.combine(target_date, max_end) if max_end else None
 
-    # Handle overnight shift
-    if shift_start_dt and shift_end_dt and shift_end_dt < shift_start_dt:
-        shift_end_dt += timedelta(days=1)
+def _build_session_summary(db: Session, s: TrackingSession, effective_point_count: Optional[int] = None) -> TrackingSessionSummary:
+    """Builds a consistent, schema-compliant TrackingSessionSummary with semantically accurate start and stop times."""
+    cnt = effective_point_count if effective_point_count is not None else (
+        s.retained_point_count if (s.retained_point_count and s.retained_point_count > 0) else db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == s.id).count()
+    )
 
-    return shift, shift_start_dt, shift_end_dt
+    interruption_count = db.query(TrackingInterruptionEvent.id).filter(TrackingInterruptionEvent.session_id == s.id).count()
+    active_interruption = db.query(TrackingInterruptionEvent.reason_code).filter(
+        TrackingInterruptionEvent.session_id == s.id,
+        TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+    ).order_by(desc(TrackingInterruptionEvent.detected_at)).first()
+
+    shift_code = s.shift.shift_code if s.shift else None
+    shift_name = s.shift.shift_name if s.shift else None
+
+    # Derive display-accurate actual start and stop times:
+    # actual_start_time: first valid in-shift coordinate, or scheduled shift start if recording
+    display_start = s.actual_start_time or (s.shift_start_time if s.status in ("RECORDING", "SCHEDULED") else s.start_time)
+
+    # actual_stop_time: if shift is active/scheduled/interrupted, return shift_end_time (scheduled end)
+    # so mobile UI displays 06:00 PM (Scheduled End) rather than falling back to last GPS fix
+    if s.status in ("RECORDING", "SCHEDULED", "PAUSED", "RECOVERING", "INTERRUPTED", "DEGRADED"):
+        display_stop = s.shift_end_time or s.end_time
+    else:
+        display_stop = s.actual_stop_time or s.end_time or s.shift_end_time
+
+    # Zero points on ended session must report INCOMPLETE, never COMPLETE
+    completeness = s.tracking_completeness
+    if not completeness:
+        completeness = "INCOMPLETE" if cnt == 0 and s.status == "COMPLETED" else "COMPLETE"
+    elif cnt == 0 and s.status == "COMPLETED":
+        completeness = "INCOMPLETE"
+
+    return TrackingSessionSummary(
+        id=s.id,
+        session_uuid=s.session_uuid,
+        user_id=s.user_id,
+        employee_id=s.user.employee_id if s.user else "UNKNOWN",
+        employee_name=s.user.full_name if s.user else "Unknown Employee",
+        work_date=str(s.work_date),
+        start_time=s.start_time,
+        end_time=s.end_time,
+        status=s.status,
+        start_latitude=float(s.start_latitude) if s.start_latitude else None,
+        start_longitude=float(s.start_longitude) if s.start_longitude else None,
+        end_latitude=float(s.end_latitude) if s.end_latitude else None,
+        end_longitude=float(s.end_longitude) if s.end_longitude else None,
+        total_distance_meters=float(s.total_distance_meters or 0.0),
+        total_duration_seconds=int(s.total_duration_seconds or 0),
+        point_count=cnt,
+        shift_id=s.shift_id,
+        shift_code=shift_code,
+        shift_name=shift_name,
+        shift_start_time=s.shift_start_time,
+        shift_end_time=s.shift_end_time,
+        actual_start_time=display_start,
+        actual_stop_time=display_stop,
+        last_accepted_time=s.last_accepted_time,
+        last_heartbeat_time=s.last_heartbeat_time,
+        last_sync_time=s.last_sync_time,
+        tracking_completeness=completeness,
+        active_interruption=active_interruption[0] if active_interruption else None,
+        interruption_count=interruption_count,
+    )
+
 
 
 @router.post("/start", response_model=StartTrackingResponse)
@@ -192,6 +311,11 @@ def start_tracking_session(
 
     # 2. Create new single tracking session for this shift
     now_utc = req.start_time or datetime.utcnow()
+    is_upcoming = shift_start_dt and (now_utc < shift_start_dt)
+    init_status = "SCHEDULED" if is_upcoming else "RECORDING"
+    init_completeness = "PENDING_SYNC"
+    act_start = None if is_upcoming else now_utc
+
     session = TrackingSession(
         session_uuid=req.session_uuid,
         user_id=current_user.id,
@@ -199,15 +323,15 @@ def start_tracking_session(
         shift_id=resolved_shift_id,
         shift_start_time=shift_start_dt,
         shift_end_time=shift_end_dt,
-        actual_start_time=now_utc,
+        actual_start_time=act_start,
         work_date=today,
         start_time=now_utc,
-        status="RECORDING",
+        status=init_status,
         start_latitude=req.start_latitude,
         start_longitude=req.start_longitude,
         total_distance_meters=0.0,
         total_duration_seconds=0,
-        tracking_completeness="COMPLETE",
+        tracking_completeness=init_completeness,
         last_heartbeat_time=now_utc,
         last_sync_time=now_utc,
     )
@@ -215,25 +339,35 @@ def start_tracking_session(
     db.commit()
     db.refresh(session)
 
-    # If valid starting coordinates are provided, insert point #1 into the route
+    # Only insert point #1 into the route if valid AND within the shift window
     if is_valid_coordinate(req.start_latitude, req.start_longitude):
-        init_point = GpsRoutePoint(
-            session_id=session.id,
-            user_id=current_user.id,
-            client_point_id=f"{session.session_uuid}_pt_1",
-            sequence_number=1,
-            latitude=float(req.start_latitude),
-            longitude=float(req.start_longitude),
-            accuracy_meters=float(req.start_accuracy_meters) if req.start_accuracy_meters is not None else 10.0,
-            altitude_meters=float(req.start_altitude_meters) if req.start_altitude_meters is not None else 0.0,
-            speed_mps=float(req.start_speed_mps) if req.start_speed_mps is not None else 0.0,
-            bearing_degrees=float(req.start_bearing_degrees) if req.start_bearing_degrees is not None else 0.0,
-            recorded_at=session.start_time,
-            is_gap=0,
-            sync_status="SYNCED",
-        )
-        db.add(init_point)
-        db.commit()
+        pt_time = session.start_time
+        in_window = True
+        if shift_start_dt and pt_time < shift_start_dt:
+            in_window = False
+        if shift_end_dt and pt_time > shift_end_dt:
+            in_window = False
+
+        if in_window:
+            init_point = GpsRoutePoint(
+                session_id=session.id,
+                user_id=current_user.id,
+                client_point_id=f"{session.session_uuid}_pt_1",
+                sequence_number=1,
+                latitude=float(req.start_latitude),
+                longitude=float(req.start_longitude),
+                accuracy_meters=float(req.start_accuracy_meters) if req.start_accuracy_meters is not None else 10.0,
+                altitude_meters=float(req.start_altitude_meters) if req.start_altitude_meters is not None else 0.0,
+                speed_mps=float(req.start_speed_mps) if req.start_speed_mps is not None else 0.0,
+                bearing_degrees=float(req.start_bearing_degrees) if req.start_bearing_degrees is not None else 0.0,
+                recorded_at=pt_time,
+                is_gap=0,
+                sync_status="SYNCED",
+            )
+            db.add(init_point)
+            session.actual_start_time = pt_time
+            session.status = "RECORDING"
+            db.commit()
 
     return StartTrackingResponse(
         success=True,
@@ -250,32 +384,66 @@ def sync_route_points(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Batch-sync recorded GPS route coordinates from mobile device to server with idempotency."""
+    """Batch-sync recorded GPS route coordinates from mobile device to server with idempotency.
+    Guarantees no unhandled duplicate key crashes, updates session sync/fix timestamps, and reconciles counts."""
     if not getattr(current_user, "travel_map_enabled", True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Travel Map / GPS Tracking is disabled for your account. New location points cannot be written."
         )
 
+    now_utc = datetime.utcnow()
     session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
     if not session:
         # Auto-recover / create session if missing so background offline points are never dropped
-        first_time = req.points[0].recorded_at if req.points else datetime.utcnow()
+        first_time = _to_naive_utc(req.points[0].recorded_at) if req.points else now_utc
+        shift, s_start, s_end = ShiftTrackingSchedulerService.resolve_shift_window(db=db, user_id=current_user.id, target_date=date.today())
+        is_upcoming = s_start and (first_time < s_start)
         session = TrackingSession(
             session_uuid=req.session_uuid,
             user_id=current_user.id,
+            shift_id=shift.id if shift else None,
+            shift_start_time=s_start,
+            shift_end_time=s_end,
+            actual_start_time=None if is_upcoming else first_time,
             work_date=date.today(),
             start_time=first_time,
-            status="RECORDING",
+            status="SCHEDULED" if is_upcoming else "RECORDING",
             total_distance_meters=req.current_distance_meters or 0.0,
             total_duration_seconds=req.current_duration_seconds or 0,
+            last_sync_time=now_utc,
+            last_heartbeat_time=now_utc,
         )
         db.add(session)
         db.commit()
         db.refresh(session)
 
+    # Ensure shift window is loaded on existing session
+    if not session.shift_start_time or not session.shift_end_time:
+        shift, s_start, s_end = ShiftTrackingSchedulerService.resolve_shift_window(
+            db=db, user_id=session.user_id, target_date=session.work_date, shift_id=session.shift_id
+        )
+        if shift and not session.shift_id:
+            session.shift_id = shift.id
+        if not session.shift_start_time:
+            session.shift_start_time = s_start
+        if not session.shift_end_time:
+            session.shift_end_time = s_end
+
     if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot upload points to another user's session.")
+
+    # Re-activate session if it was marked INTERRUPTED or DEGRADED
+    if session.status in ("INTERRUPTED", "DEGRADED", "RECOVERING"):
+        session.status = "RECORDING"
+        open_events = db.query(TrackingInterruptionEvent).filter(
+            TrackingInterruptionEvent.session_id == session.id,
+            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+        ).all()
+        for ev in open_events:
+            ev.recovered_at = now_utc
+            ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+            ev.recovery_outcome = "RECOVERED"
 
     accepted_count = 0
     duplicate_count = 0
@@ -283,62 +451,157 @@ def sync_route_points(
     synced_point_ids: List[str] = []
     rejected_point_ids: List[str] = []
     first_valid_point = None
+    latest_valid_point = None
 
-    # Retrieve current max sequence_number for this session to ensure monotonicity
+    # Retrieve current max sequence_number for this session to ensure strict monotonicity
     existing_max_seq = db.query(func.max(GpsRoutePoint.sequence_number)).filter(
         GpsRoutePoint.session_id == session.id
     ).scalar() or 0
 
     allocated_seq = existing_max_seq
 
-    for p in req.points:
+    # Query last accepted fix for session to filter near-instantaneous dual-stream duplicate fixes
+    last_stored_pt = (
+        db.query(GpsRoutePoint.latitude, GpsRoutePoint.longitude, GpsRoutePoint.recorded_at)
+        .filter(GpsRoutePoint.session_id == session.id)
+        .order_by(GpsRoutePoint.recorded_at.desc(), GpsRoutePoint.id.desc())
+        .first()
+    )
+    last_lat = float(last_stored_pt.latitude) if last_stored_pt else None
+    last_lng = float(last_stored_pt.longitude) if last_stored_pt else None
+    last_ts = _to_naive_utc(last_stored_pt.recorded_at) if last_stored_pt else None
+
+    # 1. Batch lookup of existing client_point_ids in DB to minimize queries and prevent round-trips
+    batch_client_ids = [p.client_point_id for p in req.points if p.client_point_id]
+    existing_client_ids = set()
+    if batch_client_ids:
+        for i in range(0, len(batch_client_ids), 500):
+            chunk_ids = batch_client_ids[i:i + 500]
+            rows = db.query(GpsRoutePoint.client_point_id).filter(
+                GpsRoutePoint.client_point_id.in_(chunk_ids)
+            ).all()
+            for r in rows:
+                existing_client_ids.add(r[0])
+
+    # 2. In-batch de-duplication tracker
+    seen_in_batch = set()
+
+    # Sort incoming points chronologically before persistence to guarantee monotonic sequence assignment
+    sorted_points = sorted(
+        req.points,
+        key=lambda pt: (_to_naive_utc(pt.recorded_at) or now_utc, pt.sequence_number or 0)
+    )
+
+    shift_s = _to_naive_utc(session.shift_start_time)
+    shift_e = _to_naive_utc(session.shift_end_time)
+
+    for p in sorted_points:
         if not is_valid_coordinate(p.latitude, p.longitude):
             rejected_point_ids.append(p.client_point_id)
             rejected_count += 1
             continue
+
+        p_recorded_at = _to_naive_utc(p.recorded_at) or now_utc
+
+        # STRICT SHIFT WINDOW GATING:
+        # Pre-shift coordinates (< shift_start) and post-shift coordinates (> shift_end)
+        # must be excluded from the official shift route.
+        if shift_s and p_recorded_at < shift_s:
+            rejected_point_ids.append(p.client_point_id)
+            rejected_count += 1
+            continue
+
+        if shift_e and p_recorded_at > shift_e:
+            rejected_point_ids.append(p.client_point_id)
+            rejected_count += 1
+            continue
+
+        # Check idempotency against DB and current batch
+        if p.client_point_id in existing_client_ids or p.client_point_id in seen_in_batch:
+            duplicate_count += 1
+            synced_point_ids.append(p.client_point_id)
+            continue
+
+        # Check for near-instantaneous dual-stream duplicate fix (<= 1.0s and < 2.0m)
+        if last_lat is not None and last_lng is not None and last_ts is not None:
+            dt = abs((p_recorded_at - last_ts).total_seconds())
+            if dt <= 1.0:
+                dist = calculate_haversine_distance(last_lat, last_lng, float(p.latitude), float(p.longitude))
+                if dist < 2.0:
+                    # Duplicate twin sensor fix from concurrent polling and native location stream
+                    duplicate_count += 1
+                    synced_point_ids.append(p.client_point_id)
+                    continue
+
         if first_valid_point is None:
             first_valid_point = p
 
-        # Check idempotency using stable client_point_id
-        exists = db.query(GpsRoutePoint.id).filter(
-            GpsRoutePoint.client_point_id == p.client_point_id
-        ).first()
+        if latest_valid_point is None or p_recorded_at > _to_naive_utc(latest_valid_point.recorded_at):
+            latest_valid_point = p
 
-        if exists:
+        seen_in_batch.add(p.client_point_id)
+        allocated_seq += 1
+        seq = allocated_seq
+
+        emp_id = p.employee_id or getattr(current_user, "employee_id", None)
+        dev_id = p.device_id or req.device_id or getattr(current_user, "device_id", None)
+
+        point = GpsRoutePoint(
+            session_id=session.id,
+            user_id=current_user.id,
+            employee_id=emp_id,
+            device_id=dev_id,
+            client_point_id=p.client_point_id,
+            sequence_number=seq,
+            latitude=p.latitude,
+            longitude=p.longitude,
+            accuracy_meters=p.accuracy_meters,
+            altitude_meters=p.altitude_meters,
+            speed_mps=p.speed_mps,
+            bearing_degrees=p.bearing_degrees,
+            recorded_at=p_recorded_at,
+            is_gap=1 if p.is_gap else 0,
+            sync_status="SYNCED",
+        )
+
+        try:
+            with db.begin_nested():
+                db.add(point)
+                db.flush()
+            accepted_count += 1
+            existing_client_ids.add(p.client_point_id)
+            synced_point_ids.append(p.client_point_id)
+            last_lat = float(p.latitude)
+            last_lng = float(p.longitude)
+            last_ts = p_recorded_at
+        except IntegrityError:
+            # Safely handle concurrent duplicate insert
             duplicate_count += 1
             synced_point_ids.append(p.client_point_id)
-        else:
-            allocated_seq += 1
-            seq = p.sequence_number if p.sequence_number > 0 else allocated_seq
 
-            emp_id = p.employee_id or getattr(current_user, "employee_id", None)
-            dev_id = p.device_id or req.device_id or getattr(current_user, "device_id", None)
-
-            point = GpsRoutePoint(
-                session_id=session.id,
-                user_id=current_user.id,
-                employee_id=emp_id,
-                device_id=dev_id,
-                client_point_id=p.client_point_id,
-                sequence_number=seq,
-                latitude=p.latitude,
-                longitude=p.longitude,
-                accuracy_meters=p.accuracy_meters,
-                altitude_meters=p.altitude_meters,
-                speed_mps=p.speed_mps,
-                bearing_degrees=p.bearing_degrees,
-                recorded_at=p.recorded_at,
-                is_gap=1 if p.is_gap else 0,
-                sync_status="SYNCED",
-            )
-            db.add(point)
-            accepted_count += 1
-            synced_point_ids.append(p.client_point_id)
-
-    # Backfill session start coordinates if they were null
+    # Backfill session start coordinates and actual_start_time if null
     if session.start_latitude is None and first_valid_point is not None:
         session.start_latitude = first_valid_point.latitude
         session.start_longitude = first_valid_point.longitude
+
+    if accepted_count > 0:
+        if session.actual_start_time is None and first_valid_point is not None:
+            session.actual_start_time = _to_naive_utc(first_valid_point.recorded_at)
+        if session.status in ("SCHEDULED", "INTERRUPTED", "DEGRADED"):
+            session.status = "RECORDING"
+
+    # Update session last accepted fix and sync timestamp
+    if latest_valid_point is not None:
+        latest_time = _to_naive_utc(latest_valid_point.recorded_at)
+        sess_last = _to_naive_utc(session.last_accepted_time)
+        if sess_last is None or (latest_time and latest_time >= sess_last):
+            session.last_accepted_time = latest_time
+            session.last_accepted_latitude = latest_valid_point.latitude
+            session.last_accepted_longitude = latest_valid_point.longitude
+
+    # Always update last_sync_time and last_heartbeat_time on successful point upload
+    session.last_sync_time = now_utc
+    session.last_heartbeat_time = now_utc
 
     # Update session metrics if provided
     if req.current_distance_meters is not None and req.current_distance_meters > session.total_distance_meters:
@@ -346,10 +609,15 @@ def sync_route_points(
     if req.current_duration_seconds is not None and req.current_duration_seconds > session.total_duration_seconds:
         session.total_duration_seconds = req.current_duration_seconds
 
-    session.updated_at = datetime.utcnow()
-    db.commit()
+    # Accurately maintain retained_point_count
+    total_count = db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == session.id).count()
+    session.retained_point_count = total_count
+    session.updated_at = now_utc
 
-    total_count = db.query(GpsRoutePoint).filter(GpsRoutePoint.session_id == session.id).count()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
     return SyncRoutePointsResponse(
         success=True,
@@ -361,6 +629,75 @@ def sync_route_points(
         rejected_point_ids=rejected_point_ids,
         total_points=total_count,
         message=f"Successfully processed {len(req.points)} points ({accepted_count} newly inserted, {duplicate_count} deduplicated, {rejected_count} rejected).",
+    )
+
+
+@router.post("/live-ping", response_model=LivePingResponse)
+def record_live_ping(
+    req: LivePingRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Frequent live GPS update (every 15s or 25m) from foreground/background tracker.
+    Updates the session's latest location coordinates and sync timestamp in real time."""
+    now_utc = datetime.utcnow()
+    recorded_at = _to_naive_utc(req.recorded_at or req.timestamp or now_utc)
+
+    session = None
+    if req.session_uuid:
+        session = db.query(TrackingSession).filter(TrackingSession.session_uuid == req.session_uuid).first()
+    if not session:
+        session = (
+            db.query(TrackingSession)
+            .filter(
+                TrackingSession.user_id == current_user.id,
+                TrackingSession.work_date == date.today(),
+                TrackingSession.status.in_(["RECORDING", "ACTIVE", "PAUSED", "INTERRUPTED", "DEGRADED", "RECOVERING"]),
+            )
+            .order_by(desc(TrackingSession.start_time))
+            .first()
+        )
+
+    session_id = None
+    session_status = None
+
+    if session:
+        session_id = session.id
+        session_status = session.status
+        if session.status in ("INTERRUPTED", "DEGRADED", "RECOVERING"):
+            session.status = "RECORDING"
+            open_events = db.query(TrackingInterruptionEvent).filter(
+                TrackingInterruptionEvent.session_id == session.id,
+                TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
+            ).all()
+            for ev in open_events:
+                ev.recovered_at = now_utc
+                ev.duration_seconds = max(0, int((now_utc - ev.detected_at).total_seconds()))
+                ev.recovery_outcome = "RECOVERED"
+
+        if is_valid_coordinate(req.latitude, req.longitude):
+            session.last_accepted_latitude = req.latitude
+            session.last_accepted_longitude = req.longitude
+            session.last_accepted_time = recorded_at
+            if session.start_latitude is None:
+                session.start_latitude = req.latitude
+                session.start_longitude = req.longitude
+
+        session.last_sync_time = now_utc
+        session.last_heartbeat_time = now_utc
+        session.updated_at = now_utc
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    return LivePingResponse(
+        success=True,
+        message="Live ping recorded successfully.",
+        session_id=session_id,
+        session_status=session_status or "RECORDING",
+        address=None,
+        server_time=now_utc,
     )
 
 
@@ -956,6 +1293,8 @@ def get_session_interruptions(
     if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized access to interruptions.")
 
+    _reconcile_session_health(db, session)
+
     events = (
         db.query(TrackingInterruptionEvent)
         .filter(TrackingInterruptionEvent.session_id == session.id)
@@ -1121,12 +1460,18 @@ def list_tracking_sessions(
     elif user_id:
         query = query.filter(TrackingSession.user_id == user_id)
 
+    target_d = date.today()
     if work_date:
         try:
-            d = datetime.strptime(work_date, "%Y-%m-%d").date()
-            query = query.filter(TrackingSession.work_date == d)
+            target_d = datetime.strptime(work_date, "%Y-%m-%d").date()
+            query = query.filter(TrackingSession.work_date == target_d)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    else:
+        query = query.filter(TrackingSession.work_date == target_d)
+
+    # Automatically ensure daily shift sessions exist and are reconciled for target date
+    ShiftTrackingSchedulerService.ensure_daily_sessions_for_date(db, target_date=target_d)
 
     if status:
         query = query.filter(TrackingSession.status == status)
@@ -1135,49 +1480,8 @@ def list_tracking_sessions(
 
     summaries = []
     for s in sessions:
-        cnt = s.retained_point_count if (s.retained_point_count and s.retained_point_count > 0) else db.query(GpsRoutePoint.id).filter(GpsRoutePoint.session_id == s.id).count()
-        
-        # Interruption summary
-        interruption_count = db.query(TrackingInterruptionEvent.id).filter(TrackingInterruptionEvent.session_id == s.id).count()
-        active_interruption = db.query(TrackingInterruptionEvent.reason_code).filter(
-            TrackingInterruptionEvent.session_id == s.id,
-            TrackingInterruptionEvent.recovery_outcome == "UNRESOLVED",
-        ).order_by(desc(TrackingInterruptionEvent.detected_at)).first()
-
-        shift_code = s.shift.shift_code if s.shift else None
-        shift_name = s.shift.shift_name if s.shift else None
-
-        summaries.append(
-            TrackingSessionSummary(
-                id=s.id,
-                session_uuid=s.session_uuid,
-                user_id=s.user_id,
-                employee_id=s.user.employee_id if s.user else "UNKNOWN",
-                employee_name=s.user.full_name if s.user else "Unknown Employee",
-                work_date=str(s.work_date),
-                start_time=s.start_time,
-                end_time=s.end_time,
-                status=s.status,
-                start_latitude=float(s.start_latitude) if s.start_latitude else None,
-                start_longitude=float(s.start_longitude) if s.start_longitude else None,
-                end_latitude=float(s.end_latitude) if s.end_latitude else None,
-                end_longitude=float(s.end_longitude) if s.end_longitude else None,
-                total_distance_meters=float(s.total_distance_meters),
-                total_duration_seconds=int(s.total_duration_seconds),
-                point_count=cnt,
-                shift_id=s.shift_id,
-                shift_code=shift_code,
-                shift_name=shift_name,
-                shift_start_time=s.shift_start_time,
-                shift_end_time=s.shift_end_time,
-                last_accepted_time=s.last_accepted_time,
-                last_heartbeat_time=s.last_heartbeat_time,
-                last_sync_time=s.last_sync_time,
-                tracking_completeness=s.tracking_completeness or "COMPLETE",
-                active_interruption=active_interruption[0] if active_interruption else None,
-                interruption_count=interruption_count,
-            )
-        )
+        _reconcile_session_health(db, s)
+        summaries.append(_build_session_summary(db, s))
     return summaries
 
 
@@ -1201,16 +1505,18 @@ def get_session_route(
     if session.user_id != current_user.id and current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized access to route.")
 
+    _reconcile_session_health(db, session)
+
     point_details: List[RoutePointDetail] = []
     is_raw_route = False
 
     want_simplified = (simplified is True) or (not raw)
 
-    # 1. Fetch raw points from database
+    # 1. Fetch raw points from database in strict chronological order
     raw_points = (
         db.query(GpsRoutePoint)
         .filter(GpsRoutePoint.session_id == session.id)
-        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.id.asc())
         .all()
     )
 
@@ -1224,7 +1530,7 @@ def get_session_route(
             point_details = [
                 RoutePointDetail(
                     id=p.id,
-                    sequence_number=p.sequence_number,
+                    sequence_number=i + 1,
                     client_point_id=p.client_point_id,
                     employee_id=p.employee_id or (session.user.employee_id if session.user else None),
                     device_id=p.device_id or (session.user.device_id if session.user else None),
@@ -1237,14 +1543,14 @@ def get_session_route(
                     recorded_at=p.recorded_at,
                     is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
                 )
-                for p in sim_res.simplified_points
+                for i, p in enumerate(sim_res.simplified_points)
             ]
             is_raw_route = False
         else:
             point_details = [
                 RoutePointDetail(
                     id=p.id,
-                    sequence_number=p.sequence_number,
+                    sequence_number=i + 1,
                     client_point_id=p.client_point_id,
                     employee_id=p.employee_id or (session.user.employee_id if session.user else None),
                     device_id=p.device_id or (session.user.device_id if session.user else None),
@@ -1257,7 +1563,7 @@ def get_session_route(
                     recorded_at=p.recorded_at,
                     is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
                 )
-                for p in raw_points
+                for i, p in enumerate(raw_points)
             ]
             is_raw_route = True
 
@@ -1307,13 +1613,13 @@ def get_session_route(
         raw_points = (
             db.query(GpsRoutePoint)
             .filter(GpsRoutePoint.session_id == session.id)
-            .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+            .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.id.asc())
             .all()
         )
         point_details = [
             RoutePointDetail(
                 id=p.id,
-                sequence_number=p.sequence_number,
+                sequence_number=i + 1,
                 client_point_id=p.client_point_id,
                 employee_id=p.employee_id or (session.user.employee_id if session.user else None),
                 device_id=p.device_id or (session.user.device_id if session.user else None),
@@ -1326,39 +1632,13 @@ def get_session_route(
                 recorded_at=p.recorded_at,
                 is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
             )
-            for p in raw_points
+            for i, p in enumerate(raw_points)
         ]
         is_raw_route = True
 
     effective_point_count = len(point_details)
 
-    summary = TrackingSessionSummary(
-        id=session.id,
-        session_uuid=session.session_uuid,
-        user_id=session.user_id,
-        employee_id=session.user.employee_id if session.user else "UNKNOWN",
-        employee_name=session.user.full_name if session.user else "Unknown Employee",
-        work_date=str(session.work_date),
-        start_time=session.start_time,
-        end_time=session.end_time,
-        status=session.status,
-        start_latitude=float(session.start_latitude) if session.start_latitude else None,
-        start_longitude=float(session.start_longitude) if session.start_longitude else None,
-        end_latitude=float(session.end_latitude) if session.end_latitude else None,
-        end_longitude=float(session.end_longitude) if session.end_longitude else None,
-        total_distance_meters=float(session.total_distance_meters),
-        total_duration_seconds=int(session.total_duration_seconds),
-        point_count=effective_point_count,
-        shift_id=session.shift_id,
-        shift_code=session.shift.shift_code if session.shift else None,
-        shift_name=session.shift.shift_name if session.shift else None,
-        shift_start_time=session.shift_start_time,
-        shift_end_time=session.shift_end_time,
-        last_accepted_time=session.last_accepted_time,
-        last_heartbeat_time=session.last_heartbeat_time,
-        last_sync_time=session.last_sync_time,
-        tracking_completeness=session.tracking_completeness or "COMPLETE",
-    )
+    summary = _build_session_summary(db, session, effective_point_count)
 
     return TrackingRouteResponse(
         session=summary,
@@ -1388,7 +1668,7 @@ def get_session_raw_points(
     base_query = (
         db.query(GpsRoutePoint)
         .filter(GpsRoutePoint.session_id == session.id)
-        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.id.asc())
     )
 
     total_points = base_query.count()
@@ -1401,13 +1681,14 @@ def get_session_raw_points(
     else:
         points = base_query.all()
         p_num = 1
+        offset = 0
         limit = total_points
         total_pages = 1
 
     point_details = [
         RoutePointDetail(
             id=p.id,
-            sequence_number=p.sequence_number,
+            sequence_number=offset + i + 1,
             client_point_id=p.client_point_id,
             employee_id=p.employee_id or (session.user.employee_id if session.user else None),
             device_id=p.device_id or (session.user.device_id if session.user else None),
@@ -1420,27 +1701,10 @@ def get_session_raw_points(
             recorded_at=p.recorded_at,
             is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
         )
-        for p in points
+        for i, p in enumerate(points)
     ]
 
-    summary = TrackingSessionSummary(
-        id=session.id,
-        session_uuid=session.session_uuid,
-        user_id=session.user_id,
-        employee_id=session.user.employee_id if session.user else "UNKNOWN",
-        employee_name=session.user.full_name if session.user else "Unknown Employee",
-        work_date=str(session.work_date),
-        start_time=session.start_time,
-        end_time=session.end_time,
-        status=session.status,
-        start_latitude=float(session.start_latitude) if session.start_latitude else None,
-        start_longitude=float(session.start_longitude) if session.start_longitude else None,
-        end_latitude=float(session.end_latitude) if session.end_latitude else None,
-        end_longitude=float(session.end_longitude) if session.end_longitude else None,
-        total_distance_meters=float(session.total_distance_meters),
-        total_duration_seconds=int(session.total_duration_seconds),
-        point_count=total_points,
-    )
+    summary = _build_session_summary(db, session, total_points)
 
     return RawRoutePointsResponse(
         session=summary,
@@ -1470,14 +1734,14 @@ def get_session_playback(
     raw_points = (
         db.query(GpsRoutePoint)
         .filter(GpsRoutePoint.session_id == session.id)
-        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.id.asc())
         .all()
     )
 
     playback_points = [
         PlaybackPointItem(
             id=p.id,
-            sequence_number=p.sequence_number,
+            sequence_number=i + 1,
             client_point_id=p.client_point_id,
             latitude=float(p.latitude),
             longitude=float(p.longitude),
@@ -1488,27 +1752,10 @@ def get_session_playback(
             recorded_at=p.recorded_at,
             is_gap=bool(p.is_gap) if hasattr(p, "is_gap") and p.is_gap else False,
         )
-        for p in raw_points
+        for i, p in enumerate(raw_points)
     ]
 
-    summary = TrackingSessionSummary(
-        id=session.id,
-        session_uuid=session.session_uuid,
-        user_id=session.user_id,
-        employee_id=session.user.employee_id if session.user else "UNKNOWN",
-        employee_name=session.user.full_name if session.user else "Unknown Employee",
-        work_date=str(session.work_date),
-        start_time=session.start_time,
-        end_time=session.end_time,
-        status=session.status,
-        start_latitude=float(session.start_latitude) if session.start_latitude else None,
-        start_longitude=float(session.start_longitude) if session.start_longitude else None,
-        end_latitude=float(session.end_latitude) if session.end_latitude else None,
-        end_longitude=float(session.end_longitude) if session.end_longitude else None,
-        total_distance_meters=float(session.total_distance_meters),
-        total_duration_seconds=int(session.total_duration_seconds),
-        point_count=len(playback_points),
-    )
+    summary = _build_session_summary(db, session, len(playback_points))
 
     return PlaybackRouteResponse(
         session=summary,
@@ -1548,7 +1795,7 @@ def process_ml_route(
     raw_points = (
         db.query(GpsRoutePoint)
         .filter(GpsRoutePoint.session_id == session.id)
-        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.sequence_number.asc())
+        .order_by(GpsRoutePoint.recorded_at.asc(), GpsRoutePoint.id.asc())
         .all()
     )
 

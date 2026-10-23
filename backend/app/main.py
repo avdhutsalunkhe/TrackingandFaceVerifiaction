@@ -41,8 +41,46 @@ async def lifespan(app: FastAPI):
         _ = models_manager.recognizer
         _ = models_manager.liveness
     print("[Lifespan] Biometric Pipeline loaded & warmed up.")
+
+    # Start background shift tracking scheduler loop
+    import asyncio
+    from app.services.shift_tracking_scheduler_service import ShiftTrackingSchedulerService
+
+    async def _shift_scheduler_loop():
+        # Immediate run on startup
+        try:
+            db_init = SessionLocal()
+            try:
+                ShiftTrackingSchedulerService.evaluate_and_reconcile_all(db_init)
+                print("[Lifespan] Initial shift tracking sessions evaluated and reconciled.")
+            finally:
+                db_init.close()
+        except Exception as e_init:
+            print(f"[Lifespan] Shift tracking initial reconciliation warning: {e_init}")
+
+        while True:
+            try:
+                await asyncio.sleep(60)
+                db_loop = SessionLocal()
+                try:
+                    ShiftTrackingSchedulerService.evaluate_and_reconcile_all(db_loop)
+                finally:
+                    db_loop.close()
+            except asyncio.CancelledError:
+                break
+            except Exception as e_loop:
+                print(f"[ShiftSchedulerLoop] Warning: {e_loop}")
+
+    scheduler_task = asyncio.create_task(_shift_scheduler_loop())
+
     yield
+
     # Shutdown
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
     print("[Lifespan] Application shutting down.")
 
 app = FastAPI(

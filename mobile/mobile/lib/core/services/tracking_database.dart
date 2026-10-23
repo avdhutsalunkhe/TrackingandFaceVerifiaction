@@ -747,12 +747,14 @@ class TrackingDatabase {
     );
   }
 
-  Future<List<Map<String, dynamic>>> getPendingPoints(String sessionUuid) async {
+  Future<List<Map<String, dynamic>>> getPendingPoints(String sessionUuid, [int? limit]) async {
     if (_useMemoryFallback) {
-      return _webOfflinePoints
-          .where((p) => p['session_uuid'] == sessionUuid && p['sync_status'] == 'PENDING')
-          .take(50)
-          .toList();
+      var query = _webOfflinePoints
+          .where((p) => p['session_uuid'] == sessionUuid && p['sync_status'] == 'PENDING');
+      if (limit != null && limit > 0) {
+        return query.take(limit).toList();
+      }
+      return query.toList();
     }
     final db = await database;
     if (db == null) return [];
@@ -761,16 +763,18 @@ class TrackingDatabase {
       where: 'session_uuid = ? AND sync_status = ?',
       whereArgs: [sessionUuid, 'PENDING'],
       orderBy: 'sequence_number ASC',
-      limit: 50,
+      limit: (limit != null && limit > 0) ? limit : null,
     );
   }
 
-  Future<List<Map<String, dynamic>>> getAllPendingPoints() async {
+  Future<List<Map<String, dynamic>>> getAllPendingPoints([int? limit]) async {
     if (_useMemoryFallback) {
-      return _webOfflinePoints
-          .where((p) => p['sync_status'] == 'PENDING')
-          .take(100)
-          .toList();
+      var query = _webOfflinePoints
+          .where((p) => p['sync_status'] == 'PENDING');
+      if (limit != null && limit > 0) {
+        return query.take(limit).toList();
+      }
+      return query.toList();
     }
     final db = await database;
     if (db == null) return [];
@@ -779,15 +783,16 @@ class TrackingDatabase {
       where: 'sync_status = ?',
       whereArgs: ['PENDING'],
       orderBy: 'session_uuid ASC, sequence_number ASC',
-      limit: 100,
+      limit: (limit != null && limit > 0) ? limit : null,
     );
   }
 
   Future<void> markPointsSynced(List<String> clientPointIds) async {
     if (clientPointIds.isEmpty) return;
     if (_useMemoryFallback) {
+      final idSet = clientPointIds.toSet();
       for (final p in _webOfflinePoints) {
-        if (clientPointIds.contains(p['client_point_id'])) {
+        if (idSet.contains(p['client_point_id'])) {
           p['sync_status'] = 'SYNCED';
         }
       }
@@ -795,18 +800,24 @@ class TrackingDatabase {
     }
     final db = await database;
     if (db == null) return;
-    final placeholders = List.filled(clientPointIds.length, '?').join(',');
-    await db.rawUpdate(
-      'UPDATE offline_route_points SET sync_status = ? WHERE client_point_id IN ($placeholders)',
-      ['SYNCED', ...clientPointIds],
-    );
+    // Chunk by 500 to prevent SQLite "too many SQL variables" (limit 999) error when thousands of points sync at once
+    for (var i = 0; i < clientPointIds.length; i += 500) {
+      final end = (i + 500 < clientPointIds.length) ? i + 500 : clientPointIds.length;
+      final chunk = clientPointIds.sublist(i, end);
+      final placeholders = List.filled(chunk.length, '?').join(',');
+      await db.rawUpdate(
+        'UPDATE offline_route_points SET sync_status = ? WHERE client_point_id IN ($placeholders)',
+        ['SYNCED', ...chunk],
+      );
+    }
   }
 
   Future<void> markPointsRejected(List<String> clientPointIds) async {
     if (clientPointIds.isEmpty) return;
     if (_useMemoryFallback) {
+      final idSet = clientPointIds.toSet();
       for (final p in _webOfflinePoints) {
-        if (clientPointIds.contains(p['client_point_id'])) {
+        if (idSet.contains(p['client_point_id'])) {
           p['sync_status'] = 'REJECTED';
         }
       }
@@ -814,11 +825,16 @@ class TrackingDatabase {
     }
     final db = await database;
     if (db == null) return;
-    final placeholders = List.filled(clientPointIds.length, '?').join(',');
-    await db.rawUpdate(
-      'UPDATE offline_route_points SET sync_status = ? WHERE client_point_id IN ($placeholders)',
-      ['REJECTED', ...clientPointIds],
-    );
+    // Chunk by 500 to prevent SQLite parameter overflow
+    for (var i = 0; i < clientPointIds.length; i += 500) {
+      final end = (i + 500 < clientPointIds.length) ? i + 500 : clientPointIds.length;
+      final chunk = clientPointIds.sublist(i, end);
+      final placeholders = List.filled(chunk.length, '?').join(',');
+      await db.rawUpdate(
+        'UPDATE offline_route_points SET sync_status = ? WHERE client_point_id IN ($placeholders)',
+        ['REJECTED', ...chunk],
+      );
+    }
   }
 
   // --- In-App Notification Operations ---
