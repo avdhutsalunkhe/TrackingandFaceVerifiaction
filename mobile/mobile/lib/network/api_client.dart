@@ -253,7 +253,14 @@ class ApiClient {
     final initialUrl = _failoverManager.activeUrl;
 
     try {
-      return await action(initialUrl);
+      final res = await action(initialUrl);
+      if (ApiFailoverManager.isInfrastructureFailure(null, res.statusCode)) {
+        throw ApiException(
+          'Infrastructure HTTP ${res.statusCode}',
+          statusCode: res.statusCode,
+        );
+      }
+      return res;
     } catch (e) {
       // For standard client-side / application errors (e.g. 400, 401, 403, 404),
       // remain on the same server and do not switch.
@@ -272,7 +279,14 @@ class ApiClient {
       // Retry request exactly once on alternate backend
       try {
         debugPrint('[ApiClient] Retrying request on alternate backend: $newUrl');
-        return await action(newUrl);
+        final retryRes = await action(newUrl);
+        if (ApiFailoverManager.isInfrastructureFailure(null, retryRes.statusCode)) {
+          throw ApiException(
+            ApiConfig.serviceUnavailableMessage,
+            statusCode: retryRes.statusCode,
+          );
+        }
+        return retryRes;
       } catch (retryErr) {
         debugPrint('[ApiClient] Alternate backend retry failed: $retryErr');
         if (retryErr is ApiException &&
