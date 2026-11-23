@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -12,6 +13,54 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+
+internal fun SharedPreferences.getSafeLong(key: String, defValue: Long = 0L): Long {
+    return try {
+        getLong(key, defValue)
+    } catch (_: Exception) {
+        try {
+            getInt(key, defValue.toInt()).toLong()
+        } catch (_: Exception) {
+            try {
+                getString(key, null)?.toLongOrNull() ?: defValue
+            } catch (_: Exception) {
+                defValue
+            }
+        }
+    }
+}
+
+internal fun SharedPreferences.getSafeInt(key: String, defValue: Int = 0): Int {
+    return try {
+        getInt(key, defValue)
+    } catch (_: Exception) {
+        try {
+            getLong(key, defValue.toLong()).toInt()
+        } catch (_: Exception) {
+            try {
+                getString(key, null)?.toIntOrNull() ?: defValue
+            } catch (_: Exception) {
+                defValue
+            }
+        }
+    }
+}
+
+internal fun SharedPreferences.getSafeFloat(key: String, defValue: Float = 0.0f): Float {
+    return try {
+        getFloat(key, defValue)
+    } catch (_: Exception) {
+        try {
+            getString(key, null)?.toFloatOrNull() ?: defValue
+        } catch (_: Exception) {
+            try {
+                getInt(key, defValue.toInt()).toFloat()
+            } catch (_: Exception) {
+                defValue
+            }
+        }
+    }
+}
 
 /**
  * Native Android scheduler for automatic 24*7 continuous and daily 08:00 AM – 06:00 PM
@@ -29,8 +78,9 @@ object TrackingScheduler {
     const val REQUEST_CODE_WATCHDOG = 1003
 
     fun evaluateAndSchedule(context: Context) {
-        val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        val userId = prefs.getLong("flutter.user_id", 0L).toInt()
+        try {
+            val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val userId = prefs.getSafeLong("flutter.user_id", 0L).toInt()
         val travelMapEnabled = prefs.getBoolean("flutter.travel_map_enabled", true)
         val is24x7 = prefs.getBoolean("flutter.tracking_mode_24x7", true) // Default 24*7 continuous mode
         val startTimeStr = prefs.getString("flutter.tracking_schedule_start", "08:00") ?: "08:00"
@@ -112,55 +162,62 @@ object TrackingScheduler {
             startCal.add(Calendar.DAY_OF_YEAR, 1)
             scheduleAlarm(context, startCal.timeInMillis, ACTION_START_SCHEDULED, REQUEST_CODE_START)
         }
+    } catch (e: Exception) {
+        Log.e(TAG, "Error in evaluateAndSchedule: $e")
     }
+}
 
     fun startTracking(context: Context) {
-        val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        val userId = prefs.getLong("flutter.user_id", 0L).toInt()
-        if (userId <= 0) {
-            Log.w(TAG, "Cannot start tracking: userId is 0")
-            return
-        }
-
-        val tzId = prefs.getString("flutter.tracking_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
-        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone(tzId)
-        }.format(Date())
-
-        var activeUuid = prefs.getString("flutter.active_tracking_session_uuid", null)
-        val activeDate = prefs.getString("flutter.active_tracking_date", null)
-        val shiftId = prefs.getLong("flutter.shift_id", 0L).toInt()
-
-        if (activeUuid == null || activeDate != todayStr) {
-            val shiftPart = if (shiftId > 0) "SHIFT_${shiftId}" else "GENERAL"
-            activeUuid = "TRACK_${userId}_${shiftPart}_${todayStr}"
-            prefs.edit()
-                .putString("flutter.active_tracking_session_uuid", activeUuid)
-                .putLong("flutter.active_tracking_user_id", userId.toLong())
-                .putString("flutter.active_tracking_date", todayStr)
-                .apply()
-            Log.i(TAG, "Resolved canonical single shift tracking session: $activeUuid")
-        }
-
-        val fine = ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        val coarse = ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (!fine && !coarse) {
-            Log.w(TAG, "Cannot start tracking service: location permissions not yet granted")
-            return
-        }
-
-        val serviceIntent = Intent(context, TrackingForegroundService::class.java).apply {
-            action = TrackingForegroundService.ACTION_START
-            putExtra(TrackingForegroundService.EXTRA_SESSION_UUID, activeUuid)
-            putExtra(TrackingForegroundService.EXTRA_USER_ID, userId)
-            putExtra(TrackingForegroundService.EXTRA_DATE, todayStr)
-        }
-
         try {
-            ContextCompat.startForegroundService(context, serviceIntent)
-            Log.i(TAG, "Started TrackingForegroundService successfully for session $activeUuid")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start TrackingForegroundService: $e")
+            val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val userId = prefs.getSafeLong("flutter.user_id", 0L).toInt()
+            if (userId <= 0) {
+                Log.w(TAG, "Cannot start tracking: userId is 0")
+                return
+            }
+
+            val tzId = prefs.getString("flutter.tracking_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
+            val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone(tzId)
+            }.format(Date())
+
+            var activeUuid = prefs.getString("flutter.active_tracking_session_uuid", null)
+            val activeDate = prefs.getString("flutter.active_tracking_date", null)
+            val shiftId = prefs.getSafeLong("flutter.shift_id", 0L).toInt()
+
+            if (activeUuid == null || activeDate != todayStr) {
+                val shiftPart = if (shiftId > 0) "SHIFT_${shiftId}" else "GENERAL"
+                activeUuid = "TRACK_${userId}_${shiftPart}_${todayStr}"
+                prefs.edit()
+                    .putString("flutter.active_tracking_session_uuid", activeUuid)
+                    .putLong("flutter.active_tracking_user_id", userId.toLong())
+                    .putString("flutter.active_tracking_date", todayStr)
+                    .apply()
+                Log.i(TAG, "Resolved canonical single shift tracking session: $activeUuid")
+            }
+
+            val fine = ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val coarse = ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!fine && !coarse) {
+                Log.w(TAG, "Cannot start tracking service: location permissions not yet granted")
+                return
+            }
+
+            val serviceIntent = Intent(context, TrackingForegroundService::class.java).apply {
+                action = TrackingForegroundService.ACTION_START
+                putExtra(TrackingForegroundService.EXTRA_SESSION_UUID, activeUuid)
+                putExtra(TrackingForegroundService.EXTRA_USER_ID, userId)
+                putExtra(TrackingForegroundService.EXTRA_DATE, todayStr)
+            }
+
+            try {
+                ContextCompat.startForegroundService(context, serviceIntent)
+                Log.i(TAG, "Started TrackingForegroundService successfully for session $activeUuid")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start TrackingForegroundService: $e")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unexpected error in startTracking: $t")
         }
     }
 

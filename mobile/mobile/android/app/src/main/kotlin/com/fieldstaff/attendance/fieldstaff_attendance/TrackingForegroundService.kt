@@ -95,69 +95,82 @@ class TrackingForegroundService : Service(), LocationListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START
-        Log.i(TAG, "onStartCommand action: $action")
+        try {
+            val action = intent?.action ?: ACTION_START
+            Log.i(TAG, "onStartCommand action: $action")
 
-        when (action) {
-            ACTION_STOP -> {
-                stopTrackingSession()
-                return START_NOT_STICKY
-            }
-            ACTION_PAUSE -> {
-                pauseTracking()
-                return START_STICKY
-            }
-            ACTION_RESUME -> {
-                resumeTracking()
-                return START_STICKY
-            }
-            ACTION_START -> {
-                // Must call startForeground immediately to fulfill Android foreground service contract
-                startForegroundWithNotification("Tracking started. Acquiring GPS fixes...")
-
-                // Read extras or fallback to FlutterSharedPreferences
-                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                sessionUuid = intent?.getStringExtra(EXTRA_SESSION_UUID)
-                    ?: prefs.getString("flutter.active_tracking_session_uuid", null)
-
-                userId = intent?.getIntExtra(EXTRA_USER_ID, 0)
-                    ?: (prefs.getLong("flutter.active_tracking_user_id", 0L).toInt())
-
-                totalDistanceMeters = prefs.getFloat("flutter.active_tracking_distance", 0.0f).toDouble()
-
-                if (sessionUuid == null) {
-                    val fallbackUserId = if (userId > 0) userId else prefs.getLong("flutter.user_id", 0L).toInt()
-                    if (fallbackUserId > 0) {
-                        val tzId = prefs.getString("flutter.tracking_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
-                        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
-                            timeZone = TimeZone.getTimeZone(tzId)
-                        }.format(Date())
-                        sessionUuid = "TRACK_${fallbackUserId}_GENERAL_${todayStr}"
-                        userId = fallbackUserId
-                        prefs.edit()
-                            .putString("flutter.active_tracking_session_uuid", sessionUuid)
-                            .putLong("flutter.active_tracking_user_id", fallbackUserId.toLong())
-                            .putString("flutter.active_tracking_date", todayStr)
-                            .apply()
-                        Log.i(TAG, "Auto-created canonical fallback sessionUuid: $sessionUuid")
-                    } else {
-                        Log.w(TAG, "No active session UUID or userId found. Stopping service.")
+            when (action) {
+                ACTION_STOP -> {
+                    stopTrackingSession()
+                    return START_NOT_STICKY
+                }
+                ACTION_PAUSE -> {
+                    pauseTracking()
+                    return START_STICKY
+                }
+                ACTION_RESUME -> {
+                    resumeTracking()
+                    return START_STICKY
+                }
+                ACTION_START -> {
+                    // Must call startForeground immediately to fulfill Android foreground service contract
+                    val started = startForegroundWithNotification("Tracking started. Acquiring GPS fixes...")
+                    if (!started) {
+                        Log.w(TAG, "Foreground notification start failed or not allowed. Stopping service cleanly.")
                         stopSelf()
                         return START_NOT_STICKY
                     }
+
+                    // Read extras or fallback to FlutterSharedPreferences
+                    val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                    sessionUuid = intent?.getStringExtra(EXTRA_SESSION_UUID)
+                        ?: prefs.getString("flutter.active_tracking_session_uuid", null)
+
+                    userId = intent?.getIntExtra(EXTRA_USER_ID, 0)
+                        ?: (prefs.getSafeLong("flutter.active_tracking_user_id", 0L).toInt())
+
+                    totalDistanceMeters = prefs.getSafeFloat("flutter.active_tracking_distance", 0.0f).toDouble()
+
+                    if (sessionUuid == null) {
+                        val fallbackUserId = if (userId > 0) userId else prefs.getSafeLong("flutter.user_id", 0L).toInt()
+                        if (fallbackUserId > 0) {
+                            val tzId = prefs.getString("flutter.tracking_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
+                            val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+                                timeZone = TimeZone.getTimeZone(tzId)
+                            }.format(Date())
+                            sessionUuid = "TRACK_${fallbackUserId}_GENERAL_${todayStr}"
+                            userId = fallbackUserId
+                            prefs.edit()
+                                .putString("flutter.active_tracking_session_uuid", sessionUuid)
+                                .putLong("flutter.active_tracking_user_id", fallbackUserId.toLong())
+                                .putString("flutter.active_tracking_date", todayStr)
+                                .apply()
+                            Log.i(TAG, "Auto-created canonical fallback sessionUuid: $sessionUuid")
+                        } else {
+                            Log.w(TAG, "No active session UUID or userId found. Stopping service.")
+                            stopSelf()
+                            return START_NOT_STICKY
+                        }
+                    }
+
+                    // Restore last known coordinates and sequence number from SQLite
+                    restoreStateFromDb()
+
+                    // Request location updates
+                    startLocationUpdates()
+                    isServiceRunning = true
                 }
-
-                // Restore last known coordinates and sequence number from SQLite
-                restoreStateFromDb()
-
-                // Request location updates
-                startLocationUpdates()
-                isServiceRunning = true
             }
-        }
 
-        // Return START_STICKY to allow Android process recreation after memory pressure
-        return START_STICKY
+            // Return START_STICKY to allow Android process recreation after memory pressure
+            return START_STICKY
+        } catch (t: Throwable) {
+            Log.e(TAG, "Fatal unexpected error in onStartCommand: $t", t)
+            try {
+                stopSelf()
+            } catch (_: Exception) {}
+            return START_NOT_STICKY
+        }
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -243,28 +256,37 @@ class TrackingForegroundService : Service(), LocationListener {
             .build()
     }
 
-    private fun startForegroundWithNotification(contentText: String) {
+    private fun startForegroundWithNotification(contentText: String): Boolean {
         try {
             val notification = buildNotification(status = "Active", detailText = contentText)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 if (hasLocationPermission()) {
                     startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                    return true
                 } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     // Android 14: Use dataSync foreground type when location permission is pending
                     startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                    return true
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
+                    return true
                 }
             } else {
                 startForeground(NOTIFICATION_ID, notification)
+                return true
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "startForegroundWithNotification primary failed: $e")
             try {
                 val notification = buildNotification(status = "Active", detailText = contentText)
                 startForeground(NOTIFICATION_ID, notification)
-            } catch (e2: Exception) {
+                return true
+            } catch (e2: Throwable) {
                 Log.e(TAG, "startForegroundWithNotification fatal fallback failed: $e2")
+                try {
+                    stopSelf()
+                } catch (_: Exception) {}
+                return false
             }
         }
     }
@@ -321,7 +343,7 @@ class TrackingForegroundService : Service(), LocationListener {
             db?.let { database ->
                 // Query max sequence number from SQLite and SharedPreferences
                 val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                val prefSeq = prefs.getInt("tracking_last_seq_$sUuid", 0)
+                val prefSeq = prefs.getSafeInt("tracking_last_seq_$sUuid", 0)
                 var maxSeq = prefSeq
 
                 val cursor = database.rawQuery(
